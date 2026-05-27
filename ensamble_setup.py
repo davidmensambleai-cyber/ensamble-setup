@@ -22,6 +22,15 @@ import tempfile
 
 OS = platform.system()  # "Windows" | "Darwin"
 
+if OS == "Windows":
+    try:
+        ctypes.windll.kernel32.SetConsoleCP(65001)
+        ctypes.windll.kernel32.SetConsoleOutputCP(65001)
+        sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+        sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+    except Exception:
+        pass
+
 NAS_LAN_IP       = "192.168.2.7"
 NAS_HOST_ALIAS   = "nas"
 NAS_EXTERNAL_URL = "nas.ensambleai.com"
