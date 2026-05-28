@@ -124,6 +124,52 @@ def download(url, dest_path):
     urllib.request.urlretrieve(url, dest_path)
     ok(f"Descargado: {dest_path}")
 
+def password_input(prompt="Contraseña"):
+    """Lee contraseña mostrando * por cada carácter. Cross-platform."""
+    print(f"\n  → {prompt}: ", end='', flush=True)
+    pwd = []
+    if OS == "Windows":
+        import msvcrt
+        while True:
+            ch = msvcrt.getwch()
+            if ch in ('\r', '\n'):
+                break
+            if ch == '\x03':
+                raise KeyboardInterrupt
+            if ch in ('\x00', '\xe0'):
+                msvcrt.getwch()  # tecla especial de dos bytes — ignorar
+                continue
+            if ch == '\x08':  # Backspace
+                if pwd:
+                    pwd.pop()
+                    print('\b \b', end='', flush=True)
+            else:
+                pwd.append(ch)
+                print('*', end='', flush=True)
+    else:
+        import termios, tty
+        fd = sys.stdin.fileno()
+        old = termios.tcgetattr(fd)
+        try:
+            tty.setraw(fd)
+            while True:
+                ch = sys.stdin.read(1)
+                if ch in ('\r', '\n'):
+                    break
+                if ch == '\x03':
+                    raise KeyboardInterrupt
+                if ch == '\x7f':  # Backspace
+                    if pwd:
+                        pwd.pop()
+                        print('\b \b', end='', flush=True)
+                else:
+                    pwd.append(ch)
+                    print('*', end='', flush=True)
+        finally:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old)
+    print()
+    return ''.join(pwd)
+
 
 # ─────────────────────────────────────────────
 # SECCIÓN: NOMBRE DEL EQUIPO
@@ -183,8 +229,8 @@ def _agregar_hosts():
     except PermissionError:
         err("Sin permisos para modificar el archivo hosts.")
 
-def _montar_unidad_win(letra, share, usuario, password):
-    unc = f"\\\\{NAS_LAN_IP}\\{share}"
+def _montar_unidad_win(letra, share, usuario=None, password=None):
+    unc = f"\\\\{NAS_HOST_ALIAS}\\{share}"
     # Eliminar mapeo previo si existe
     run(f'net use {letra} /delete /y', check=False)
     cmd = f'net use {letra} "{unc}" /persistent:yes'
@@ -198,7 +244,7 @@ def _montar_unidad_win(letra, share, usuario, password):
 
 def _montar_smb_mac(share, punto_montaje, usuario, password):
     os.makedirs(punto_montaje, exist_ok=True)
-    unc = f"smb://{usuario}:{password}@{NAS_LAN_IP}/{share}"
+    unc = f"smb://{usuario}:{password}@{NAS_HOST_ALIAS}/{share}"
     result = run(f"mount_smbfs '{unc}' '{punto_montaje}'", check=False)
     if result.returncode == 0:
         ok(f"Montado en {punto_montaje}")
@@ -229,13 +275,12 @@ def seccion_nas_interno():
     # Credenciales NAS
     info("\n  Ingresa tus credenciales del NAS:")
     usuario_nas = ask("Usuario NAS")
-    import getpass
-    password_nas = getpass.getpass("  → Contraseña NAS: ")
+    password_nas = password_input("Contraseña NAS")
 
     if OS == "Windows":
         _montar_unidad_win(DRIVE_ENSAMBLE, SHARE_ENSAMBLE, usuario_nas, password_nas)
         if admin:
-            _montar_unidad_win(DRIVE_ARCHIVO, SHARE_ARCHIVO, usuario_nas, password_nas)
+            _montar_unidad_win(DRIVE_ARCHIVO, SHARE_ARCHIVO)  # reutiliza sesión ya abierta
             info(f"Perfil admin: se montaron {DRIVE_ENSAMBLE} y {DRIVE_ARCHIVO}.")
         else:
             info(f"Perfil Asociado: se montó {DRIVE_ENSAMBLE}.")
