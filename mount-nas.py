@@ -178,11 +178,56 @@ def _tcp_abierto(host, port, timeout=3.0):
     except Exception:
         return False
 
+def _which(name):
+    """Busca un ejecutable en PATH usando solo os (sin shutil — evita imports nuevos)."""
+    for d in os.environ.get("PATH", "").split(os.pathsep):
+        cand = os.path.join(d, name)
+        if os.path.isfile(cand) and os.access(cand, os.X_OK):
+            return cand
+    return None
+
+def _tailscale_cli():
+    """
+    Ruta del CLI de Tailscale. CLAVE en Mac: el CLI NO está en el PATH — la app lo
+    trae dentro del bundle (/Applications/Tailscale.app/Contents/MacOS/Tailscale).
+    Devuelve la ruta (string) o None.
+    """
+    p = _which("tailscale.exe" if OS == "Windows" else "tailscale")
+    if p:
+        return p
+    if OS == "Windows":
+        cands = [r"C:\Program Files\Tailscale\tailscale.exe",
+                 r"C:\Program Files (x86)\Tailscale\tailscale.exe"]
+    else:
+        cands = ["/Applications/Tailscale.app/Contents/MacOS/Tailscale",
+                 os.path.expanduser("~/Applications/Tailscale.app/Contents/MacOS/Tailscale"),
+                 "/usr/local/bin/tailscale",
+                 "/opt/homebrew/bin/tailscale"]
+    for c in cands:
+        if os.path.exists(c):
+            return c
+    return None
+
+def _tailscale_peer_alcanzable():
+    """Alcanzabilidad real del NAS por Tailscale: TCP al puerto DSM HTTPS. Verdad de terreno."""
+    return _tcp_abierto(NAS_TAILSCALE_IP, DSM_HTTPS_PORT, timeout=4.0)
+
 def _tailscale_instalado():
-    return run("tailscale version", check=False, capture=True).returncode == 0
+    if _tailscale_cli():
+        return True
+    # Mac: la app puede estar instalada aunque el CLI no resuelva por PATH
+    if OS == "Darwin" and os.path.exists("/Applications/Tailscale.app"):
+        return True
+    return False
 
 def _tailscale_activo():
-    r = run("tailscale status", check=False, capture=True)
+    # Si el NAS Tailscale es alcanzable, el túnel está arriba — no depende del CLI.
+    if _tailscale_peer_alcanzable():
+        return True
+    cli = _tailscale_cli()
+    if not cli:
+        return False
+    r = run(f'"{cli}" status', check=False, capture=True)
     out = (r.stdout or "") + (r.stderr or "")
     if r.returncode != 0:
         return False
@@ -190,9 +235,13 @@ def _tailscale_activo():
         return False
     return "100." in out
 
-def _tailscale_peer_alcanzable():
-    """Alcanzabilidad real del NAS por Tailscale: TCP al puerto DSM HTTPS."""
-    return _tcp_abierto(NAS_TAILSCALE_IP, DSM_HTTPS_PORT, timeout=4.0)
+def _tailscale_login():
+    cli = _tailscale_cli()
+    if not cli:
+        warn("No encontré el CLI de Tailscale para iniciar sesión.")
+        info("Abre la app de Tailscale e inicia sesión manualmente.")
+        return
+    run(f'"{cli}" login', check=False)
 
 def _dns_resuelve(host, expected_ip):
     """(resuelve_a_esperado, conjunto_de_ips). Usa DNS público — no requiere Tailscale."""
@@ -356,21 +405,21 @@ def diagnosticar(ubicacion):
     oficina = (ubicacion == "oficina")
 
     # ── Tailscale ──────────────────────────────────────────────
+    # Verdad de terreno: si el NAS Tailscale responde, el túnel está arriba.
+    ts_peer = _tailscale_peer_alcanzable()
     ts_inst = _tailscale_instalado()
-    ts_act = ts_inst and _tailscale_activo()
-    ts_peer = ts_act and _tailscale_peer_alcanzable()
-    if not ts_inst:
+    if ts_peer:
+        capas.append(_capa("Tailscale", VERDE, "Activo — NAS alcanzable (100.81.124.50)",
+                           "VPN para entrar al NAS desde cualquier lugar"))
+    elif not ts_inst:
         capas.append(_capa("Tailscale", ROJO, "No está instalado",
                            "VPN para entrar al NAS desde cualquier lugar", "configurar"))
-    elif not ts_act:
+    elif not _tailscale_activo():
         capas.append(_capa("Tailscale", ROJO, "Instalado pero sin sesión activa",
                            "VPN para entrar al NAS desde cualquier lugar", "configurar"))
-    elif not ts_peer:
-        capas.append(_capa("Tailscale", AMBAR, "Activo pero no alcanza al NAS (100.81.124.50)",
-                           "VPN para entrar al NAS desde cualquier lugar", None))
     else:
-        capas.append(_capa("Tailscale", VERDE, "Instalado, sesión activa y NAS alcanzable",
-                           "VPN para entrar al NAS desde cualquier lugar"))
+        capas.append(_capa("Tailscale", AMBAR, "Activo pero el NAS no responde aún",
+                           "VPN para entrar al NAS desde cualquier lugar", None))
 
     # ── DNS ────────────────────────────────────────────────────
     dns_ok, ips = _dns_resuelve(NAS_EXTERNAL_URL, NAS_TAILSCALE_IP)
@@ -692,13 +741,13 @@ def _instalar_tailscale():
         ok("Tailscale instalado.")
         info("Se abrirá el browser para iniciar sesión.")
         info("Usa la cuenta Google de Ensamble que te asignaron.")
-        run("tailscale login", check=False)
+        _tailscale_login()
     elif OS == "Darwin":
         dest = os.path.join(tmp, "tailscale.pkg")
         download(TAILSCALE_MAC_URL, dest)
         run(f"installer -pkg '{dest}' -target /")
         ok("Tailscale instalado.")
-        run("/Applications/Tailscale.app/Contents/MacOS/Tailscale login", check=False)
+        _tailscale_login()
 
 def _instalar_synology_drive():
     tmp = tempfile.gettempdir()
@@ -731,8 +780,7 @@ def _configurar_lan():
 
     # Tailscale — opcional (laptops que también salen de la oficina)
     info("")
-    ts_ok = run("tailscale version", check=False, capture=True).returncode == 0
-    if ts_ok:
+    if _tailscale_instalado():
         ok("Tailscale ya está instalado.")
     elif confirm("¿Este equipo también se usa fuera de la oficina? → instalar Tailscale"):
         _instalar_tailscale()
@@ -754,15 +802,14 @@ def _configurar_externo():
 
     # Tailscale — siempre
     info("")
-    ts_ok = run("tailscale version", check=False, capture=True).returncode == 0
-    if ts_ok:
+    if _tailscale_instalado():
         if _tailscale_activo():
             ok("Tailscale instalado y activo.")
         else:
             ok("Tailscale instalado pero sin sesión.")
             info("Iniciando sesión — se abrirá el browser.")
             info("Usa la cuenta Google de Ensamble que te asignaron.")
-            run("tailscale login", check=False)
+            _tailscale_login()
     else:
         _instalar_tailscale()
 
