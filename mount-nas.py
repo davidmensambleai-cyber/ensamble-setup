@@ -278,7 +278,11 @@ def _smb_montado():
 
 def _synodrive_instalado():
     if OS == "Windows":
-        return os.path.exists(r"C:\Program Files\SynologyDrive\SynologyDrive.exe")
+        paths = [
+            r"C:\Program Files\SynologyDrive\SynologyDrive.exe",
+            r"C:\Program Files (x86)\Synology\SynologyDrive\bin\launcher.exe",
+        ]
+        return any(os.path.exists(p) for p in paths)
     else:
         return os.path.exists("/Applications/Synology Drive Client.app")
 
@@ -658,8 +662,12 @@ def _conectar_externo():
     ok("Tailscale activo.")
 
     if OS == "Windows":
-        drive_exe = r"C:\Program Files\SynologyDrive\SynologyDrive.exe"
-        if os.path.exists(drive_exe):
+        drive_paths = [
+            r"C:\Program Files\SynologyDrive\SynologyDrive.exe",
+            r"C:\Program Files (x86)\Synology\SynologyDrive\bin\launcher.exe",
+        ]
+        drive_exe = next((p for p in drive_paths if os.path.exists(p)), None)
+        if drive_exe:
             ok("Synology Drive instalado.")
             info("Abriendo Synology Drive...")
             run(f'start "" "{drive_exe}"', check=False)
