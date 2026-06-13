@@ -82,11 +82,21 @@ def warn(msg): print(f"  ⚠  {msg}")
 def err(msg):  print(f"  ✖  {msg}")
 def info(msg): print(f"     {msg}")
 
-def ask(prompt, options=None):
+def ask(prompt, options=None, _max_intentos=10):
+    intentos = 0
     while True:
-        val = input(f"\n  → {prompt}: ").strip()
+        try:
+            val = input(f"\n  → {prompt}: ").strip()
+        except EOFError:
+            # stdin cerrado (terminal muerta): cancelar en vez de girar/crashear.
+            warn("Entrada cerrada (EOF). Cancelando.")
+            raise KeyboardInterrupt
         if not options or val in options:
             return val
+        intentos += 1
+        if intentos >= _max_intentos:
+            warn("Demasiados intentos inválidos. Cancelando.")
+            raise KeyboardInterrupt
         warn(f"Opción inválida. Válidas: {', '.join(options)}")
 
 def confirm(prompt):
@@ -128,6 +138,10 @@ def password_input(prompt="Contraseña"):
             tty.setraw(fd)
             while True:
                 ch = sys.stdin.read(1)
+                if ch == '':
+                    # EOF: stdin cerrado. read(1) devuelve '' indefinidamente —
+                    # sin esta guarda, el bucle gira al 100% de CPU para siempre.
+                    raise KeyboardInterrupt
                 if ch in ('\r', '\n'):
                     break
                 if ch == '\x03':
@@ -973,6 +987,20 @@ def menu_clasico():
 
 
 def main():
+    # Guarda de TTY: esta herramienta es 100% interactiva. Si stdin no es una
+    # terminal real (proceso huérfano, lanzado sin consola, terminal cerrada),
+    # salir limpio. Sin esto, los bucles de input() giran al 100% de CPU sobre
+    # un stdin muerto — causa de los procesos zombie que recalentaban el equipo.
+    try:
+        es_tty = sys.stdin.isatty()
+    except Exception:
+        es_tty = False
+    if not es_tty:
+        sys.stderr.write(
+            "mount-nas requiere una terminal interactiva. No hay TTY disponible — saliendo.\n"
+        )
+        sys.exit(0)
+
     # Modo configurar: re-lanzado con permisos de admin
     if "--configure" in sys.argv:
         seccion_configurar()
