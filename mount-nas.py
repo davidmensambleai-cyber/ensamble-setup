@@ -26,6 +26,11 @@ import glob
 
 OS = platform.system()
 
+# PyInstaller en Mac no incluye los certificados del sistema operativo.
+# Sin esto, cualquier descarga HTTPS falla con SSLCertVerificationError.
+if OS == "Darwin" and os.path.exists("/etc/ssl/cert.pem"):
+    os.environ.setdefault("SSL_CERT_FILE", "/etc/ssl/cert.pem")
+
 if OS == "Windows":
     try:
         ctypes.windll.kernel32.SetConsoleCP(65001)
