@@ -609,8 +609,8 @@ def reconectar_synodrive():
 # [1] CONECTAR NAS  (lógica existente — reusada)
 # ─────────────────────────────────────────────
 
-def _montar_unidad_win(letra, share, usuario, password):
-    unc = f"\\\\{NAS_HOST_ALIAS}\\{share}"
+def _montar_unidad_win(letra, share, usuario, password, host=NAS_HOST_ALIAS):
+    unc = f"\\\\{host}\\{share}"
     run(f'net use {letra} /delete /y', check=False, capture=True)
     cmd = f'net use {letra} "{unc}" /persistent:yes /user:"{usuario}" "{password}"'
     result = run(cmd, check=False)
@@ -645,7 +645,10 @@ def _conectar_lan():
     if OS == "Windows":
         ok_z = _montar_unidad_win(DRIVE_ENSAMBLE, SHARE_ENSAMBLE, usuario, pwd)
         if es_admin:
-            ok_y = _montar_unidad_win(DRIVE_ARCHIVO, SHARE_ARCHIVO, usuario, pwd)
+            # Host distinto al de Ensamble: Windows bloquea 2 conexiones persistentes
+            # al mismo servidor con credenciales guardadas ("no se permiten varias
+            # conexiones... con más de un nombre de usuario"). IP directa evita el choque.
+            ok_y = _montar_unidad_win(DRIVE_ARCHIVO, SHARE_ARCHIVO, usuario, pwd, host=NAS_LAN_IP)
             if ok_z and ok_y:
                 ok(f"Unidades {DRIVE_ENSAMBLE} y {DRIVE_ARCHIVO} montadas.")
             elif ok_z:
