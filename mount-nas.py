@@ -320,6 +320,10 @@ def _synodrive_db_dirs():
             os.path.expanduser("~/Library/Application Support/SynologyDrive"),
         ]
 
+_EXTENSIONES_ARCHIVO = ('.pdf', '.docx', '.doc', '.xlsx', '.xls', '.pptx', '.ppt',
+                        '.jpg', '.jpeg', '.png', '.gif', '.zip', '.rar', '.txt',
+                        '.csv', '.json', '.dwg', '.rvt', '.skp')
+
 def _parece_servidor(val):
     """Heurística: ¿este string parece una dirección de servidor?"""
     if not isinstance(val, str):
@@ -328,7 +332,9 @@ def _parece_servidor(val):
     if not v or len(v) > 120 or " " in v or "\\" in v or v.count("/") > 0:
         return False
     low = v.lower()
-    if "quickconnect.to" in low or "ensambleai" in low:
+    if low.endswith(_EXTENSIONES_ARCHIVO):
+        return False
+    if "quickconnect.to" in low or low == "ensambleai":
         return True
     # hostname con TLD conocido o IP
     if re.fullmatch(r'[A-Za-z0-9.\-]+\.(com|to|me|net|org)', low):
