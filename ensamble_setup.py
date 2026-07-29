@@ -166,7 +166,11 @@ def _run_ps_script(script_content: str):
 # Submenú: cambiar nombre (+crear cuenta admin alineada) / eliminar cuenta en desuso
 # ─────────────────────────────────────────────
 
-BUILTIN_ACCOUNTS = {"administrator", "guest", "defaultaccount", "wdagutilityaccount"}
+# Administrator/Guest se TRADUCEN por idioma de Windows (en español: Administrador/
+# Invitado — confirmado real en pc_13); DefaultAccount/WDAGUtilityAccount no se traducen.
+# Los RIDs (últimos dígitos del SID) son fijos e independientes del idioma en toda
+# instalación de Windows — se usan para excluir estas cuentas en vez del nombre.
+BUILTIN_RIDS = {"500", "501", "503", "504"}  # Administrator, Guest, DefaultAccount, WDAGUtilityAccount
 
 
 def _validar_nombre_cuenta(nombre: str) -> bool:
@@ -200,15 +204,20 @@ def crear_cuenta_admin_alineada(nombre: str):
         f'powershell -Command "(Get-LocalUser -Name \'{nombre}\' -ErrorAction SilentlyContinue).Name"',
         check=False, capture=True,
     )
-    if check_existente.stdout and check_existente.stdout.strip():
-        warn(f"Ya existe una cuenta local llamada '{nombre}'.")
-        if not confirm("¿Continuar de todos modos?"):
+    ya_existe = bool(check_existente.stdout and check_existente.stdout.strip())
+    if ya_existe:
+        warn(f"Ya existe una cuenta local llamada '{nombre}' (probablemente de un intento anterior).")
+        info("Se completarán solo los pasos que falten: contraseña, grupo de administradores y perfil.")
+        if not confirm("¿Continuar?"):
             return
 
     if dry_run:
         info("\n[DRY-RUN] No se pide contraseña ni se ejecuta nada — solo se describe el plan:")
-        info(f"  1. New-LocalUser -Name '{nombre}' (con la contraseña que se pediría en modo real)")
-        info(f"  2. Add-LocalGroupMember -Group Administrators -Member '{nombre}'")
+        if ya_existe:
+            info(f"  1. (Se omite — '{nombre}' ya existe) Se usaría Set-LocalUser en vez de New-LocalUser")
+        else:
+            info(f"  1. New-LocalUser -Name '{nombre}' (con la contraseña que se pediría en modo real)")
+        info(f"  2. Agregar '{nombre}' al grupo de administradores si no está ya (por SID, no por nombre — ver nota abajo)")
         info(f"  3. Forzar creación de C:\\Users\\{nombre} vía tarea programada temporal (schtasks)")
         ok("Simulación completa. Sin cambios realizados.")
         return
@@ -227,17 +236,40 @@ def crear_cuenta_admin_alineada(nombre: str):
         return
 
     password_escaped = password.replace("'", "''")
-    ps_create = (
-        f"$sec = ConvertTo-SecureString '{password_escaped}' -AsPlainText -Force\n"
-        f"New-LocalUser -Name '{nombre}' -Password $sec -PasswordNeverExpires -AccountNeverExpires -ErrorAction Stop\n"
-        f"Add-LocalGroupMember -Group 'Administrators' -Member '{nombre}' -ErrorAction Stop\n"
-    )
-    result = _run_ps_script(ps_create)
+    # El grupo local "Administrators" está TRADUCIDO por idioma de Windows (en español
+    # es "Administradores") — Add-LocalGroupMember -Group 'Administrators' falla en
+    # cualquier Windows en español con GroupNotFoundException. El SID del grupo
+    # integrado de administradores (S-1-5-32-544) es universal, independiente del
+    # idioma — confirmado real en pc_13 (Get-LocalGroup -SID 'S-1-5-32-544' → "Administradores").
+    # Get-LocalGroupMember devuelve el nombre como "<equipo>\<usuario>" — se compara por
+    # sufijo, no por igualdad directa (confirmado real en pc_13).
+    if ya_existe:
+        # Idempotente: cubre el caso de una corrida anterior que falló a medias (ej. la
+        # cuenta se creó pero no se pudo agregar al grupo por el bug de localización).
+        # Set-LocalUser -PasswordNeverExpires necesita $true/$false explícito (a
+        # diferencia de New-LocalUser, donde es un switch) — confirmado real en pc_13.
+        ps_cuenta = (
+            f"$sec = ConvertTo-SecureString '{password_escaped}' -AsPlainText -Force\n"
+            f"Set-LocalUser -Name '{nombre}' -Password $sec -PasswordNeverExpires $true "
+            f"-AccountNeverExpires -ErrorAction Stop\n"
+            f"$yaAdmin = Get-LocalGroupMember -SID 'S-1-5-32-544' -ErrorAction SilentlyContinue | "
+            f'Where-Object {{ $_.Name -like "*\\{nombre}" }}\n'
+            f"if (-not $yaAdmin) {{ Add-LocalGroupMember -SID 'S-1-5-32-544' -Member '{nombre}' -ErrorAction Stop }}\n"
+        )
+    else:
+        ps_cuenta = (
+            f"$sec = ConvertTo-SecureString '{password_escaped}' -AsPlainText -Force\n"
+            f"New-LocalUser -Name '{nombre}' -Password $sec -PasswordNeverExpires -AccountNeverExpires -ErrorAction Stop\n"
+            f"Add-LocalGroupMember -SID 'S-1-5-32-544' -Member '{nombre}' -ErrorAction Stop\n"
+        )
+    result = _run_ps_script(ps_cuenta)
     if result.returncode != 0:
-        err(f"No se pudo crear la cuenta o agregarla a Administrators: {result.stderr.strip()}")
+        verbo_error = "completar" if ya_existe else "crear"
+        err(f"No se pudo {verbo_error} la cuenta o agregarla al grupo de administradores: {result.stderr.strip()}")
         del password, password_escaped
         return
-    ok(f"Cuenta '{nombre}' creada y agregada a Administrators.")
+    verbo_ok = "actualizada" if ya_existe else "creada"
+    ok(f"Cuenta '{nombre}' {verbo_ok} y en el grupo de administradores.")
     del password_escaped
 
     info("Forzando creación del perfil de usuario (tarea programada temporal)...")
@@ -262,8 +294,12 @@ def crear_cuenta_admin_alineada(nombre: str):
     ok("Cuenta admin alineada creada.")
     info("Próximos pasos:")
     info(f"  1. Cierra sesión y entra con la cuenta '{nombre}'.")
-    info("  2. Verifica que todo funcione (NAS, Drive, accesos).")
-    info("  3. Vuelve a correr el script → Nombre del equipo → Eliminar cuenta en desuso,")
+    info("  2. Configura un PIN de inicio de sesión: Configuración → Cuentas →")
+    info("     Opciones de inicio de sesión → PIN de Windows Hello.")
+    info("     (No se puede hacer desde el script — Windows Hello requiere sesión")
+    info("     interactiva de esa cuenta para crear el PIN.)")
+    info("  3. Verifica que todo funcione (NAS, Drive, accesos).")
+    info("  4. Vuelve a correr el script → Nombre del equipo → Eliminar cuenta en desuso,")
     info("     para borrar la cuenta anterior.")
     print(LINE)
 
@@ -315,15 +351,25 @@ def seccion_eliminar_cuenta_desuso():
     info(f"Cuenta de nombre actual: {hostname}")
     info("Escaneando cuentas locales habilitadas...")
 
-    result = run(
-        'powershell -Command "Get-LocalUser | Where-Object {$_.Enabled -eq $true} | '
-        'Select-Object -ExpandProperty Name"',
-        capture=True, check=False,
+    ps_scan = (
+        "Get-LocalUser | Where-Object { $_.Enabled -eq $true } | ForEach-Object {\n"
+        '    "$($_.Name)|$($_.SID)"\n'
+        "}\n"
     )
-    cuentas = [c.strip() for c in result.stdout.splitlines() if c.strip()]
+    result = _run_ps_script(ps_scan)
+    cuentas = []
+    for linea in result.stdout.splitlines():
+        linea = linea.strip()
+        if not linea or '|' not in linea:
+            continue
+        nombre_cuenta, sid = linea.rsplit('|', 1)
+        cuentas.append((nombre_cuenta.strip(), sid.strip().rsplit('-', 1)[-1]))
 
-    excluidas = {hostname.lower(), "asociado"} | BUILTIN_ACCOUNTS
-    candidatas = [c for c in cuentas if c.lower() not in excluidas]
+    excluidas_nombre = {hostname.lower(), "asociado"}
+    candidatas = [
+        nombre for nombre, rid in cuentas
+        if nombre.lower() not in excluidas_nombre and rid not in BUILTIN_RIDS
+    ]
 
     if not candidatas:
         ok("No se detectaron cuentas en desuso.")
