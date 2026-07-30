@@ -446,6 +446,10 @@ APPX_BLOATWARE = [
     "Microsoft.OneDriveSync",
     "MicrosoftTeams",
     "Microsoft.MicrosoftEdge.Stable",
+    # Agregados 2026-07-29 — verificados en vivo contra pc_13 (Get-AppxPackage real)
+    "Microsoft.OutlookForWindows",
+    "MSTeams",
+    "Microsoft.Copilot",
 ]
 
 
@@ -460,7 +464,8 @@ def seccion_bloatware_servicios():
     info("  1. Restore point")
     info("  2. Win11Debloat (script de terceros — github.com/Raphire/Win11Debloat)")
     info("  3. Remove-AppxPackage complementario")
-    info("  4. Deshabilitar servicios SysMain y DiagTrack")
+    info("  4. Desinstalar OneDrive y Dropbox (no son Appx)")
+    info("  5. Deshabilitar servicios SysMain y DiagTrack")
 
     dry_run = not confirm("\n¿Ejecutar en modo real? ('n' corre en modo dry-run / solo simulación)")
     if dry_run:
@@ -518,6 +523,34 @@ def seccion_bloatware_servicios():
                 no_encontrados += 1
         verbo = "se removerían" if dry_run else "removido(s)"
         ok(f"{removidos} paquete(s) {verbo}, {no_encontrados} no encontrado(s) o ya ausente(s).")
+
+    if confirm("¿Desinstalar OneDrive y Dropbox? (no son paquetes Appx, se manejan aparte)"):
+        # OneDrive no es Appx — se instala vía OneDriveSetup.exe. Probar primero la ruta
+        # por-usuario (la más común), luego la ruta por-máquina como fallback.
+        onedrive_candidatos = [
+            Path(os.environ.get("LOCALAPPDATA", "")) / "Microsoft" / "OneDrive" / "OneDriveSetup.exe",
+            Path(os.environ.get("SYSTEMROOT", "C:/Windows")) / "SysWOW64" / "OneDriveSetup.exe",
+        ]
+        onedrive_exe = next((p for p in onedrive_candidatos if p.exists()), None)
+        if onedrive_exe:
+            if dry_run:
+                info(f"  [DRY-RUN] Se ejecutaría: \"{onedrive_exe}\" /uninstall")
+            else:
+                run(f'"{onedrive_exe}" /uninstall', check=False)
+                info("  OneDrive desinstalado.")
+        else:
+            info("  OneDrive no está instalado (no se encontró OneDriveSetup.exe).")
+
+        # Dropbox tampoco es Appx ni encaja en VENDORS (no es Adobe/Autodesk/Graphisoft/
+        # SketchUp) — se desinstala vía winget. ID confirmado en vivo: Dropbox.Dropbox.
+        if dry_run:
+            info("  [DRY-RUN] Se ejecutaría: winget uninstall --id Dropbox.Dropbox -e --silent")
+        else:
+            result = run("winget uninstall --id Dropbox.Dropbox -e --silent", check=False)
+            if result.returncode == 0:
+                info("  Dropbox desinstalado.")
+            else:
+                info("  Dropbox no estaba instalado (o winget no lo encontró).")
 
     if confirm("¿Deshabilitar servicios SysMain y DiagTrack?"):
         if dry_run:
@@ -1305,6 +1338,33 @@ def seccion_aislar_software_profesional():
 
 
 # ─────────────────────────────────────────────
+# SECCIÓN: CONFIGURACIÓN INICIAL
+# Ajustes de sistema que no encajan en instalar/desinstalar. Solo Windows.
+# ─────────────────────────────────────────────
+
+ALTO_RENDIMIENTO_GUID = "8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c"  # GUID fijo de Windows, no localizado
+
+
+def seccion_configuracion_inicial():
+    title("CONFIGURACIÓN INICIAL")
+
+    if not IS_WIN:
+        warn("Esta sección es solo para Windows. No aplica en Mac.")
+        return
+
+    if confirm("¿Activar el plan de energía 'Alto rendimiento'?"):
+        estado = run("powercfg /list", check=False, capture=True).stdout or ""
+        linea_guid = next((l for l in estado.splitlines() if ALTO_RENDIMIENTO_GUID in l), "")
+        if "*" in linea_guid:
+            ok("Ya estaba activo — sin cambios.")
+        else:
+            run(f"powercfg /setactive {ALTO_RENDIMIENTO_GUID}", check=False)
+            ok("Plan 'Alto rendimiento' activado.")
+
+    ok("Sección configuración inicial completada.")
+
+
+# ─────────────────────────────────────────────
 # SUBMENÚS
 # ─────────────────────────────────────────────
 
@@ -1353,6 +1413,7 @@ MENU = {
     "1": ("Nombre del equipo", seccion_nombre_equipo),
     "2": ("Desinstalación", seccion_desinstalacion),
     "3": ("Instalación", seccion_instalacion),
+    "4": ("Configuración inicial", seccion_configuracion_inicial),
 }
 
 def main():
