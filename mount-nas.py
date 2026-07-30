@@ -64,6 +64,9 @@ SYNODRIVE_MAC_URL = (
     "https://global.download.synology.com/download/Tools/SynologyDriveClient"
     "/3.5.1-16120/Mac/Synology%20Drive%20Client-3.5.1-16120.dmg"
 )
+SYNODRIVE_DOWNLOAD_PAGE = (
+    "https://www.synology.com/en-global/support/download/SynologyDriveClient"
+)
 
 # Ruta de caché donde el launcher guarda este script (usada para auto-elevación)
 _CACHE_PATH = os.path.join(os.path.expanduser("~"), ".mount_nas.py")
@@ -787,18 +790,35 @@ def _instalar_tailscale():
 
 def _instalar_synology_drive():
     tmp = tempfile.gettempdir()
+    descargado = False
     if OS == "Windows":
         dest = os.path.join(tmp, "synodrive_setup.exe")
-        download(SYNODRIVE_WIN_URL, dest)
-        run(f'"{dest}" /S')
-        ok("Synology Drive instalado.")
+        try:
+            download(SYNODRIVE_WIN_URL, dest)
+            run(f'"{dest}" /S')
+            ok("Synology Drive instalado.")
+            descargado = True
+        except Exception as e:
+            warn(f"No se pudo descargar automáticamente ({type(e).__name__}).")
+            info("Abriendo el centro de descarga de Synology en el navegador...")
+            run(f'start "" "{SYNODRIVE_DOWNLOAD_PAGE}"', check=False)
     elif OS == "Darwin":
         dest = os.path.join(tmp, "synodrive.dmg")
-        download(SYNODRIVE_MAC_URL, dest)
-        run(f"hdiutil attach '{dest}' -quiet")
-        run("installer -pkg '/Volumes/Synology Drive Client/Synology Drive Client.pkg' -target /")
-        run(f"hdiutil detach '/Volumes/Synology Drive Client' -quiet", check=False)
-        ok("Synology Drive instalado.")
+        try:
+            download(SYNODRIVE_MAC_URL, dest)
+            run(f"hdiutil attach '{dest}' -quiet")
+            run("installer -pkg '/Volumes/Synology Drive Client/Synology Drive Client.pkg' -target /")
+            run(f"hdiutil detach '/Volumes/Synology Drive Client' -quiet", check=False)
+            ok("Synology Drive instalado.")
+            descargado = True
+        except Exception as e:
+            warn(f"No se pudo descargar automáticamente ({type(e).__name__}).")
+            info("Abriendo el centro de descarga de Synology en el navegador...")
+            run(f"open '{SYNODRIVE_DOWNLOAD_PAGE}'", check=False)
+    if not descargado:
+        info("  → Descarga 'Synology Drive Client' e instálalo.")
+        info("  → Cuando termine, vuelve a abrir este programa para configurarlo.")
+        return
     info("Configura el servidor en Synology Drive:")
     info(f"  Dirección: {NAS_EXTERNAL_URL}  ·  marca SSL  ·  SIN puerto")
     info(f"  (si pidiera puerto: {NAS_EXTERNAL_URL}:{DSM_HTTPS_PORT})")
