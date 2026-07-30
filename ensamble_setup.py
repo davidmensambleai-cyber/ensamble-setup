@@ -485,12 +485,18 @@ def seccion_bloatware_servicios():
             info("[DRY-RUN] Se abriría Win11Debloat (omitido en simulación — su menú es interactivo y queda fuera de nuestro control).")
         else:
             info("Abriendo Win11Debloat...")
-            run(
+            # URL correcta confirmada 2026-07-29 contra github.com/Raphire/Win11Debloat
+            # (el dominio "win11debloat.raphi.re" usado antes estaba mal — devolvía una
+            # página HTML en vez del script, causando errores de parseo en PowerShell).
+            result = run(
                 'powershell -Command "Set-ExecutionPolicy Unrestricted -Scope Process; '
-                "& ([scriptblock]::Create((irm 'https://win11debloat.raphi.re/')))\"",
+                "& ([scriptblock]::Create((irm 'https://debloat.raphi.re/')))\"",
                 check=False,
             )
-            ok("Win11Debloat ejecutado (revisa su propio menú interactivo).")
+            if result.returncode == 0:
+                ok("Win11Debloat ejecutado (revisa su propio menú interactivo).")
+            else:
+                err(f"Win11Debloat terminó con errores (código {result.returncode}). Revisa el mensaje de arriba.")
 
     if confirm("¿Remover apps residuales via Remove-AppxPackage?"):
         info(f"Procesando {len(APPX_BLOATWARE)} paquete(s)...")
@@ -1015,21 +1021,22 @@ def seccion_programas_profesionales():
 # ─────────────────────────────────────────────
 # SECCIÓN: INSTALACIÓN → SOFTWARE BÁSICO
 # Fuente de verdad: config_parque_tecnologico.json → software.todos_los_equipos_ensamble
-# Solo Windows (winget). Synology Drive Client y Claude Desktop no tienen ID de winget
-# confirmado en la fuente — se dejan como instalación manual para no fabricar un ID.
+# Solo Windows (winget). Todos los IDs verificados 2026-07-29 con `winget search` real
+# en pc_13 — incluye la corrección de Python.Python.3 (deprecado, ya no existe en el
+# catálogo) → Python.Python.3.13, y Synology/Claude (sí tienen ID, no había que dejarlos
+# manuales como antes).
 # ─────────────────────────────────────────────
 
 SOFTWARE_BASICO_WINGET = [
     ("Google Chrome", "Google.Chrome"),
-    ("Python 3.13+", "Python.Python.3"),
+    ("Python 3.13", "Python.Python.3.13"),
     ("Git", "Git.Git"),
     ("Google Drive", "Google.GoogleDrive"),
     ("Tailscale", "Tailscale.Tailscale"),
-]
-
-SOFTWARE_BASICO_MANUAL = [
-    ("Synology Drive Client", "Sin ID de winget confirmado — descargar directo desde el sitio de Synology."),
-    ("Claude Desktop", "Sin ID de winget confirmado — instalar desde claude.ai/download."),
+    ("Synology Drive Client", "Synology.DriveClient"),
+    ("Claude Desktop", "Anthropic.Claude"),
+    ("WinDirStat", "WinDirStat.WinDirStat"),
+    ("Visual Studio Code", "Microsoft.VisualStudioCode"),
 ]
 
 
@@ -1041,17 +1048,22 @@ def seccion_software_basico():
         return
 
     info("Fuente: config_parque_tecnologico.json → software.todos_los_equipos_ensamble")
-    info(f"\n  Se instalarán {len(SOFTWARE_BASICO_WINGET)} paquete(s) via winget:")
+    info(f"\n  Se revisarán {len(SOFTWARE_BASICO_WINGET)} paquete(s) via winget (se omite el que ya esté instalado):")
     for nombre, _ in SOFTWARE_BASICO_WINGET:
-        info(f"    - {nombre}")
-    info(f"\n  {len(SOFTWARE_BASICO_MANUAL)} paquete(s) requieren instalación manual (detalle al final):")
-    for nombre, _ in SOFTWARE_BASICO_MANUAL:
         info(f"    - {nombre}")
 
     if not confirm(f"\n¿Instalar los {len(SOFTWARE_BASICO_WINGET)} paquetes via winget?"):
         return
 
     for nombre, pkg_id in SOFTWARE_BASICO_WINGET:
+        # winget list -e devuelve 0 si el paquete ya está instalado, distinto de 0 si no
+        # (confirmado real en pc_13) — evita re-descargar instaladores de decenas/cientos
+        # de MB en cada corrida para software que ya estaba.
+        check = run(f'winget list --id {pkg_id} -e', check=False, capture=True)
+        if check.returncode == 0:
+            ok(f"{nombre} ya está instalado — omitido.")
+            continue
+
         info(f"\n  Instalando {nombre}...")
         result = run(
             f'winget install --id {pkg_id} -e --accept-package-agreements --accept-source-agreements',
@@ -1061,10 +1073,6 @@ def seccion_software_basico():
             ok(f"{nombre} instalado.")
         else:
             err(f"{nombre} — winget devolvió código {result.returncode}. Revisa manualmente.")
-
-    warn("\nPendiente instalación manual (sin ID winget confirmado):")
-    for nombre, nota in SOFTWARE_BASICO_MANUAL:
-        info(f"  {nombre}: {nota}")
 
     ok("\nSección software básico completada.")
 
