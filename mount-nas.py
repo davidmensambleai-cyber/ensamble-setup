@@ -1,6 +1,6 @@
 """
 mount-nas.py — Conecta y configura la NAS Ensamble
-Arranca con un DIAGNÓSTICO automático por capas y enruta las acciones.
+Pregunta con qué módulo operar (red de la oficina / fuera de la oficina) y enruta las acciones.
 Corre SIN admin por defecto. Solo pide admin para Configurar.
 Windows + Mac.
 """
@@ -184,13 +184,6 @@ def download(url, dest_path):
 # ─────────────────────────────────────────────
 # SONDAS DE RED (stdlib, cross-platform)
 # ─────────────────────────────────────────────
-
-def detectar_red():
-    """Devuelve 'lan' si el NAS local responde por ping, 'external' si no."""
-    ping = (f"ping -n 1 -w 1000 {NAS_LAN_IP}" if OS == "Windows"
-            else f"ping -c 1 -W 1 {NAS_LAN_IP}")
-    r = run(ping, check=False, capture=True)
-    return "lan" if r.returncode == 0 else "external"
 
 def _tcp_abierto(host, port, timeout=3.0):
     """True si se puede abrir un socket TCP al host:puerto."""
@@ -398,14 +391,14 @@ def _clasificar_synodrive(candidatos, https_ok):
         viejo = next((c for c in candidatos
                       if "quickconnect.to" in c.lower() or re.search(r'ensambleai\.i\w*\d', c.lower())),
                      candidatos[0] if candidatos else "?")
-        return ROJO, f"Apunta a un canal viejo: {viejo}"
+        return ROJO, f"Está conectado a una dirección antigua ({viejo}) — hay que reconectarlo"
     if apunta_bien:
         if https_ok:
-            return VERDE, "Apunta a nas.ensambleai.com y responde"
-        return AMBAR, "Apunta a nas.ensambleai.com pero el servidor no responde (¿Tailscale apagado?)"
+            return VERDE, "Está bien conectado y funcionando"
+        return AMBAR, "Está bien conectado, pero el NAS no responde ahora mismo (revisa que Tailscale esté activo)"
     if candidatos:
-        return AMBAR, f"Servidor no reconocido: {candidatos[0]}"
-    return AMBAR, "No se pudo leer el servidor configurado"
+        return AMBAR, f"No reconozco a dónde está conectado ({candidatos[0]}) — revisar"
+    return AMBAR, "No pude leer a dónde está conectado"
 
 
 # ─────────────────────────────────────────────
@@ -416,107 +409,118 @@ def _capa(nombre, estado, detalle, para_que, accion=None):
     return {"capa": nombre, "estado": estado, "detalle": detalle,
             "para_que": para_que, "accion": accion}
 
-def detectar_ubicacion():
-    """Auto-detecta oficina/fuera y deja que el usuario confirme o corrija."""
-    info("Detectando tu ubicación...")
-    red = detectar_red()
-    propuesta = "oficina" if red == "lan" else "fuera"
-    otra = "fuera" if propuesta == "oficina" else "oficina"
-    if propuesta == "oficina":
-        ok(f"El NAS responde en la red local ({NAS_LAN_IP}) → parece que estás en la OFICINA.")
+def elegir_modulo():
+    """Pregunta con qué módulo se quiere operar. Sin auto-detección — el usuario elige siempre."""
+    print()
+    print("  [1] Montar la NAS estando en la red de la oficina")
+    print("  [2] Montar la NAS estando en una red fuera de la oficina")
+    opcion = ask("Selecciona una opción", ["1", "2"])
+    return "oficina" if opcion == "1" else "fuera"
+
+def preguntar_otro_modulo(actual):
+    """Tras terminar un módulo, ofrece dejar listo también el otro — en lenguaje simple."""
+    if actual == "oficina":
+        ok("Ya dejamos lista la conexión para cuando estés en la oficina.")
+        pregunta = ("¿Este computador alguna vez sale de la oficina (por ejemplo, es un "
+                    "portátil que te llevas a la casa)? Si es así, puedo dejarlo listo "
+                    "para que también funcione desde afuera.")
+        otro = "fuera"
     else:
-        info(f"El NAS no responde en la red local → parece que estás FUERA de la oficina.")
-    if confirm(f"¿Es correcto que estás en la {propuesta}?"):
-        return propuesta
-    info(f"Entendido — usaré modo: {otra}.")
-    return otra
+        ok("Ya dejamos lista la conexión para cuando estés fuera de la oficina.")
+        pregunta = ("¿Este computador también se usa dentro de la oficina? "
+                    "Si es así, puedo dejarlo listo para que también funcione ahí.")
+        otro = "oficina"
+    if confirm(pregunta):
+        return otro
+    return None
 
 def diagnosticar(ubicacion):
-    """Construye la lista de capas con estado verde/rojo/ámbar y acción sugerida."""
+    """Construye la lista de capas del módulo elegido — cada módulo ve solo lo suyo."""
     capas = []
     oficina = (ubicacion == "oficina")
 
-    # ── Tailscale ──────────────────────────────────────────────
-    # Verdad de terreno: si el NAS Tailscale responde, el túnel está arriba.
-    ts_peer = _tailscale_peer_alcanzable()
-    ts_inst = _tailscale_instalado()
-    if ts_peer:
-        capas.append(_capa("Tailscale", VERDE, "Activo — NAS alcanzable (100.81.124.50)",
-                           "VPN para entrar al NAS desde cualquier lugar"))
-    elif not ts_inst:
-        capas.append(_capa("Tailscale", ROJO, "No está instalado",
-                           "VPN para entrar al NAS desde cualquier lugar", "configurar"))
-    elif not _tailscale_activo():
-        capas.append(_capa("Tailscale", ROJO, "Instalado pero sin sesión activa",
-                           "VPN para entrar al NAS desde cualquier lugar", "configurar"))
-    else:
-        capas.append(_capa("Tailscale", AMBAR, "Activo pero el NAS no responde aún",
-                           "VPN para entrar al NAS desde cualquier lugar", None))
-
-    # ── DNS ────────────────────────────────────────────────────
-    dns_ok, ips = _dns_resuelve(NAS_EXTERNAL_URL, NAS_TAILSCALE_IP)
-    if dns_ok:
-        capas.append(_capa("DNS", VERDE, f"{NAS_EXTERNAL_URL} → {NAS_TAILSCALE_IP}",
-                           "Traduce el nombre del NAS a su dirección"))
-    elif ips:
-        capas.append(_capa("DNS", AMBAR, f"{NAS_EXTERNAL_URL} resuelve a {', '.join(sorted(ips))}",
-                           "Traduce el nombre del NAS a su dirección"))
-    else:
-        capas.append(_capa("DNS", ROJO, f"{NAS_EXTERNAL_URL} no resuelve",
-                           "Traduce el nombre del NAS a su dirección"))
-
-    # ── Reverse proxy (DSM por HTTPS) ──────────────────────────
-    https_ok, codigo = _https_responde(NAS_EXTERNAL_URL)
-    if https_ok:
-        capas.append(_capa("Acceso web (HTTPS)", VERDE,
-                           f"DSM responde en https://{NAS_EXTERNAL_URL} (HTTP {codigo})",
-                           "Entrar al NAS por navegador con candado verde"))
-    else:
-        capas.append(_capa("Acceso web (HTTPS)", ROJO,
-                           f"https://{NAS_EXTERNAL_URL} no responde ({codigo})",
-                           "Entrar al NAS por navegador con candado verde",
-                           None if ts_peer else "configurar"))
-
-    # ── SMB (solo oficina) ─────────────────────────────────────
     if oficina:
+        # ── Carpeta compartida del NAS ────────────────────────────
         if _smb_montado():
             destino = DRIVE_ENSAMBLE if OS == "Windows" else f"/Volumes/{SHARE_ENSAMBLE}"
-            capas.append(_capa("Carpeta de red (SMB)", VERDE, f"Montada en {destino}",
-                               "Trabajar archivos del NAS como una carpeta local"))
+            capas.append(_capa("Carpeta compartida del NAS", VERDE, f"Ya está conectada en {destino}",
+                               "así ves y guardas los archivos del NAS como una carpeta más de tu computador"))
         else:
-            capas.append(_capa("Carpeta de red (SMB)", ROJO, "No está montada",
-                               "Trabajar archivos del NAS como una carpeta local", "conectar"))
+            capas.append(_capa("Carpeta compartida del NAS", ROJO, "Todavía no está conectada",
+                               "así ves y guardas los archivos del NAS como una carpeta más de tu computador",
+                               "conectar"))
 
-    # ── Synology Drive ─────────────────────────────────────────
-    if not _synodrive_instalado():
-        capas.append(_capa("Synology Drive", ROJO, "No está instalado",
-                           "Sincronizar carpetas del NAS al equipo", "configurar"))
-    else:
-        candidatos = _synodrive_servidores_configurados()
-        estado_sd, detalle_sd = _clasificar_synodrive(candidatos, https_ok)
-        accion_sd = "reconectar_synodrive" if estado_sd == ROJO else None
-        capas.append(_capa("Synology Drive", estado_sd, detalle_sd,
-                           "Sincronizar carpetas del NAS al equipo", accion_sd))
-
-    # ── Acceso web LAN / hosts (solo oficina) ──────────────────
-    if oficina:
+        # ── Navegador dentro de la oficina ─────────────────────────
         if _hosts_tiene_alias():
-            capas.append(_capa("Alias LAN (hosts)", VERDE,
-                               f"'{NAS_HOST_ALIAS}' presente → http://{NAS_HOST_ALIAS}:{DSM_HTTP_PORT}",
-                               "Entrar al NAS por navegador dentro de la oficina"))
+            capas.append(_capa("Navegador dentro de la oficina", VERDE,
+                               f"Listo — puedes entrar escribiendo http://{NAS_HOST_ALIAS}:{DSM_HTTP_PORT} en el navegador",
+                               "para entrar al NAS escribiendo su nombre en el navegador, sin memorizar números"))
         else:
-            capas.append(_capa("Alias LAN (hosts)", ROJO,
-                               f"Falta '{NAS_HOST_ALIAS}' en el archivo hosts",
-                               "Entrar al NAS por navegador dentro de la oficina", "configurar"))
+            capas.append(_capa("Navegador dentro de la oficina", ROJO, "Todavía falta configurarlo",
+                               "para entrar al NAS escribiendo su nombre en el navegador, sin memorizar números",
+                               "configurar"))
+
+    else:
+        # ── Tailscale ────────────────────────────────────────────────
+        ts_peer = _tailscale_peer_alcanzable()
+        ts_inst = _tailscale_instalado()
+        if ts_peer:
+            capas.append(_capa("Tailscale", VERDE, "Ya está funcionando — el NAS responde",
+                               "el programa que te deja entrar al NAS aunque no estés en la oficina"))
+        elif not ts_inst:
+            capas.append(_capa("Tailscale", ROJO, "Todavía no está instalado en este computador",
+                               "el programa que te deja entrar al NAS aunque no estés en la oficina", "configurar"))
+        elif not _tailscale_activo():
+            capas.append(_capa("Tailscale", ROJO, "Está instalado pero falta iniciar sesión",
+                               "el programa que te deja entrar al NAS aunque no estés en la oficina", "configurar"))
+        else:
+            capas.append(_capa("Tailscale", AMBAR, "Está encendido pero el NAS no responde todavía",
+                               "el programa que te deja entrar al NAS aunque no estés en la oficina", None))
+
+        # ── Dirección del NAS en internet ───────────────────────────
+        dns_ok, ips = _dns_resuelve(NAS_EXTERNAL_URL, NAS_TAILSCALE_IP)
+        if dns_ok:
+            capas.append(_capa("Dirección del NAS en internet", VERDE, f"{NAS_EXTERNAL_URL} apunta bien",
+                               "para que el navegador sepa a dónde ir cuando escribes el nombre del NAS"))
+        elif ips:
+            capas.append(_capa("Dirección del NAS en internet", AMBAR,
+                               f"{NAS_EXTERNAL_URL} apunta a otro lugar ({', '.join(sorted(ips))}) — revisar",
+                               "para que el navegador sepa a dónde ir cuando escribes el nombre del NAS"))
+        else:
+            capas.append(_capa("Dirección del NAS en internet", ROJO, f"{NAS_EXTERNAL_URL} no se pudo encontrar",
+                               "para que el navegador sepa a dónde ir cuando escribes el nombre del NAS"))
+
+        # ── Navegador desde cualquier lugar ─────────────────────────
+        https_ok, codigo = _https_responde(NAS_EXTERNAL_URL)
+        if https_ok:
+            capas.append(_capa("Navegador desde cualquier lugar", VERDE,
+                               f"Funciona — https://{NAS_EXTERNAL_URL} responde",
+                               "para entrar al NAS por el navegador, con el candado verde de seguridad, estés donde estés"))
+        else:
+            capas.append(_capa("Navegador desde cualquier lugar", ROJO,
+                               f"https://{NAS_EXTERNAL_URL} no responde todavía",
+                               "para entrar al NAS por el navegador, con el candado verde de seguridad, estés donde estés",
+                               None if ts_peer else "configurar"))
+
+        # ── Synology Drive ────────────────────────────────────────
+        if not _synodrive_instalado():
+            capas.append(_capa("Synology Drive", ROJO, "Todavía no está instalado",
+                               "el programa que copia automáticamente las carpetas del NAS a tu computador", "configurar"))
+        else:
+            candidatos = _synodrive_servidores_configurados()
+            estado_sd, detalle_sd = _clasificar_synodrive(candidatos, https_ok)
+            accion_sd = "reconectar_synodrive" if estado_sd == ROJO else None
+            capas.append(_capa("Synology Drive", estado_sd, detalle_sd,
+                               "el programa que copia automáticamente las carpetas del NAS a tu computador", accion_sd))
 
     return capas
 
 def imprimir_tarjeta(capas):
     simbolos = {VERDE: "✔", ROJO: "✖", AMBAR: "⚠"}
-    title("DIAGNÓSTICO DE CONEXIÓN AL NAS")
+    title("CÓMO ESTÁ TU CONEXIÓN AL NAS")
     for c in capas:
         s = simbolos.get(c["estado"], "·")
-        print(f"  {s}  {c['capa']:<22} {c['detalle']}")
+        print(f"  {s}  {c['capa']:<32} {c['detalle']}")
     print()
 
 
@@ -527,7 +531,7 @@ def imprimir_tarjeta(capas):
 def enrutar(capas, ubicacion):
     """
     Decide y propone acciones según el diagnóstico. Devuelve dict con lo ejecutado.
-    Orden: configurar (infra/admin) → reconectar SynoDrive → conectar (montar SMB).
+    Orden: configurar (requiere admin) → reconectar SynoDrive → conectar (carpeta compartida).
     Cada acción pide confirmación.
     """
     resultado = {"acciones": [], "nota": None}
@@ -536,41 +540,41 @@ def enrutar(capas, ubicacion):
     # Todo verde
     if all(c["estado"] == VERDE for c in capas):
         title("RESULTADO")
-        ok("Conexión ya funcionando. No hay nada que hacer.")
+        ok("Todo está funcionando. No hay nada que hacer.")
         return resultado
 
     title("QUÉ HACER")
     fallas = [c for c in capas if c["estado"] != VERDE]
-    info("Detecté lo siguiente para resolver:")
+    info("Encontré esto para resolver:")
     for c in fallas:
         simbolo = "✖" if c["estado"] == ROJO else "⚠"
         print(f"     {simbolo} {c['capa']}: {c['detalle']}")
 
-    # 1) Configurar (Tailscale / SynoDrive faltante / hosts) — requiere admin
+    # 1) Configurar (Tailscale / SynoDrive faltante / alias del navegador) — requiere admin
     if "configurar" in acciones:
         info("")
-        info("Falta instalar o configurar componentes (requiere administrador).")
-        if confirm("¿Ejecutar CONFIGURAR ahora?"):
-            seccion_configurar()
+        info("Falta instalar o configurar algo (se necesita permiso de administrador).")
+        if confirm("¿Hacerlo ahora?"):
+            seccion_configurar(ubicacion)
             resultado["acciones"].append("configurar")
             if OS == "Windows":
-                resultado["nota"] = ("La configuración se abrió en otra ventana (admin). "
-                                     "Complétala allí; este resumen refleja el estado previo.")
+                resultado["nota"] = ("La configuración se abrió en otra ventana (con permiso de administrador). "
+                                     "Complétala ahí; este resumen refleja el estado de antes.")
 
-    # 2) Reconectar SynoDrive (canal viejo) — guía guiada, no se reescribe en silencio
+    # 2) Reconectar SynoDrive (dirección antigua) — guía guiada, no se reescribe en silencio
     if "reconectar_synodrive" in acciones:
         info("")
-        warn("Synology Drive apunta a un canal viejo (QuickConnect/DDNS).")
-        info("No se puede reescribir su configuración en silencio (Synology no lo soporta).")
-        if confirm("¿Cerrar el cliente y mostrar la guía para reconectarlo?"):
+        warn("Synology Drive está conectado a una dirección antigua.")
+        info("Eso no se puede corregir solo — hay que hacerlo desde la app.")
+        if confirm("¿Cerrar Synology Drive y mostrarte la guía para reconectarlo?"):
             reconectar_synodrive()
             resultado["acciones"].append("reconectar_synodrive")
 
-    # 3) Conectar (montar SMB) — solo oficina, infra OK
+    # 3) Conectar (carpeta compartida) — solo módulo oficina, con todo lo demás listo
     if "conectar" in acciones:
         info("")
-        if confirm("¿Montar ahora la carpeta de red del NAS (CONECTAR)?"):
-            seccion_conectar()
+        if confirm("¿Conectar ahora la carpeta compartida del NAS?"):
+            seccion_conectar(ubicacion)
             resultado["acciones"].append("conectar")
 
     return resultado
@@ -590,11 +594,11 @@ def _cerrar_synodrive():
 
 def reconectar_synodrive():
     title("RECONECTAR SYNOLOGY DRIVE")
-    info("Cerrando el cliente de Synology Drive...")
+    info("Cerrando Synology Drive...")
     _cerrar_synodrive()
-    ok("Cliente cerrado.")
+    ok("Listo, se cerró.")
     print()
-    print("  Sigue estos pasos (la app puede variar un poco según su versión):")
+    print("  Sigue estos pasos (la app puede verse un poco distinta según la versión):")
     print()
     print('  1. Abre el programa "Synology Drive Client".')
     print("  2. Si no se abre la ventana, búscalo en la barra de tareas (junto al reloj):")
@@ -644,8 +648,6 @@ def _montar_smb_mac(share, punto_montaje, usuario, password):
         return False
 
 def _conectar_lan():
-    ok(f"Red local detectada ({NAS_LAN_IP}).")
-    info("")
     info("Ingresa tus credenciales del NAS:")
     usuario = ask("Usuario NAS")
     pwd = password_input("Contraseña NAS")
@@ -682,15 +684,15 @@ def _conectar_lan():
         info("Para montaje automático: Finder → Conectar al servidor → guardar en Login Items.")
 
 def _conectar_externo():
-    info("Sin acceso a red local. Verificando acceso remoto...")
+    info("Verificando la conexión remota (Tailscale)...")
     if not _tailscale_activo():
         warn("Tailscale no está activo o no está instalado.")
-        info("Tailscale es necesario para conectarte al NAS de forma remota.")
+        info("Tailscale es el programa necesario para conectarte al NAS desde fuera de la oficina.")
         if confirm("¿Ir a Configurar equipo para instalar Tailscale?"):
-            _elevar_para_configurar()
+            _elevar_para_configurar("fuera")
         return
 
-    ok("Tailscale activo.")
+    ok("Tailscale está activo.")
 
     if OS == "Windows":
         drive_paths = [
@@ -699,29 +701,28 @@ def _conectar_externo():
         ]
         drive_exe = next((p for p in drive_paths if os.path.exists(p)), None)
         if drive_exe:
-            ok("Synology Drive instalado.")
+            ok("Synology Drive está instalado.")
             info("Abriendo Synology Drive...")
             run(f'start "" "{drive_exe}"', check=False)
-            info("Synology Drive maneja la sincronización con el NAS automáticamente.")
+            info("Synology Drive se encarga de mantener sincronizados los archivos con el NAS.")
         else:
             warn("Synology Drive no está instalado.")
             if confirm("¿Ir a Configurar equipo para instalarlo?"):
-                _elevar_para_configurar()
+                _elevar_para_configurar("fuera")
     elif OS == "Darwin":
         drive_app = "/Applications/Synology Drive Client.app"
         if os.path.exists(drive_app):
-            ok("Synology Drive instalado.")
+            ok("Synology Drive está instalado.")
             run("open '/Applications/Synology Drive Client.app'", check=False)
-            info("Synology Drive maneja la sincronización con el NAS automáticamente.")
+            info("Synology Drive se encarga de mantener sincronizados los archivos con el NAS.")
         else:
             warn("Synology Drive no está instalado.")
             if confirm("¿Ir a Configurar equipo para instalarlo?"):
-                _elevar_para_configurar()
+                _elevar_para_configurar("fuera")
 
-def seccion_conectar():
+def seccion_conectar(ubicacion):
     title("CONECTAR NAS")
-    red = detectar_red()
-    if red == "lan":
+    if ubicacion == "oficina":
         _conectar_lan()
     else:
         _conectar_externo()
@@ -741,18 +742,19 @@ def _get_script_path():
         pass
     return _CACHE_PATH
 
-def _elevar_para_configurar():
+def _elevar_para_configurar(ubicacion):
     script = _get_script_path()
+    flag = "--oficina" if ubicacion == "oficina" else "--fuera"
     if OS == "Windows":
         # Abre nueva ventana elevada — la ventana actual sigue esperando Enter
         ctypes.windll.shell32.ShellExecuteW(
             None, "runas", sys.executable,
-            f'"{script}" --configure',
+            f'"{script}" --configure {flag}',
             None, 1
         )
     else:
         # Sincrónico en Mac — corre en la misma ventana con sudo
-        subprocess.run(["/usr/bin/sudo", sys.executable, script, "--configure"])
+        subprocess.run(["/usr/bin/sudo", sys.executable, script, "--configure", flag])
 
 def _hosts_tiene_alias():
     hosts = r"C:\Windows\System32\drivers\etc\hosts" if OS == "Windows" else "/etc/hosts"
@@ -767,9 +769,9 @@ def _agregar_hosts():
     try:
         with open(hosts, "a", encoding="utf-8") as f:
             f.write(linea)
-        ok(f"Alias '{NAS_HOST_ALIAS}' → {NAS_LAN_IP} agregado al archivo hosts.")
+        ok(f"Listo — ahora puedes escribir '{NAS_HOST_ALIAS}' en el navegador para entrar al NAS.")
     except PermissionError:
-        err("Sin permisos para modificar el archivo hosts.")
+        err("No se pudo hacer este cambio — faltan permisos de administrador.")
 
 def _instalar_tailscale():
     tmp = tempfile.gettempdir()
@@ -777,15 +779,15 @@ def _instalar_tailscale():
         dest = os.path.join(tmp, "tailscale_setup.exe")
         download(TAILSCALE_WIN_URL, dest)
         run(f'"{dest}" /quiet /norestart')
-        ok("Tailscale instalado.")
-        info("Se abrirá el browser para iniciar sesión.")
+        ok("Tailscale quedó instalado.")
+        info("Se abrirá el navegador para que inicies sesión.")
         info("Usa la cuenta Google de Ensamble que te asignaron.")
         _tailscale_login()
     elif OS == "Darwin":
         dest = os.path.join(tmp, "tailscale.pkg")
         download(TAILSCALE_MAC_URL, dest)
         run(f"installer -pkg '{dest}' -target /")
-        ok("Tailscale instalado.")
+        ok("Tailscale quedó instalado.")
         _tailscale_login()
 
 def _instalar_synology_drive():
@@ -798,8 +800,8 @@ def _instalar_synology_drive():
             run(f'"{dest}" /S')
             ok("Synology Drive instalado.")
             descargado = True
-        except Exception as e:
-            warn(f"No se pudo descargar automáticamente ({type(e).__name__}).")
+        except Exception:
+            warn("No se pudo descargar automáticamente.")
             info("Abriendo el centro de descarga de Synology en el navegador...")
             run(f'start "" "{SYNODRIVE_DOWNLOAD_PAGE}"', check=False)
     elif OS == "Darwin":
@@ -811,8 +813,8 @@ def _instalar_synology_drive():
             run(f"hdiutil detach '/Volumes/Synology Drive Client' -quiet", check=False)
             ok("Synology Drive instalado.")
             descargado = True
-        except Exception as e:
-            warn(f"No se pudo descargar automáticamente ({type(e).__name__}).")
+        except Exception:
+            warn("No se pudo descargar automáticamente.")
             info("Abriendo el centro de descarga de Synology en el navegador...")
             run(f"open '{SYNODRIVE_DOWNLOAD_PAGE}'", check=False)
     if not descargado:
@@ -825,51 +827,33 @@ def _instalar_synology_drive():
     info(f"  Carpeta: {SHARE_ENSAMBLE} → modo On-Demand. Requiere Tailscale activo.")
 
 def _configurar_lan():
-    title("CONFIGURAR EQUIPO — RED LOCAL")
+    title("CONFIGURAR EQUIPO — RED DE LA OFICINA")
 
-    # Alias en hosts — siempre (para acceso web por nombre)
     if _hosts_tiene_alias():
-        ok(f"Alias '{NAS_HOST_ALIAS}' ya existe en hosts.")
+        ok(f"Ya puedes escribir '{NAS_HOST_ALIAS}' en el navegador para entrar al NAS.")
     else:
-        info("Configurando alias del NAS en archivo hosts...")
+        info("Configurando el acceso al NAS por navegador...")
         _agregar_hosts()
-
-    # Tailscale — opcional (laptops que también salen de la oficina)
-    info("")
-    if _tailscale_instalado():
-        ok("Tailscale ya está instalado.")
-    elif confirm("¿Este equipo también se usa fuera de la oficina? → instalar Tailscale"):
-        _instalar_tailscale()
-
-    # Synology Drive — opcional
-    drive_ok = _synodrive_instalado()
-    info("")
-    if drive_ok:
-        ok("Synology Drive ya está instalado.")
-    elif confirm("¿Instalar Synology Drive Client? (sincronización / acceso remoto)"):
-        _instalar_synology_drive()
 
     info("")
     ok("Configuración completada.")
 
 def _configurar_externo():
-    title("CONFIGURAR EQUIPO — ACCESO REMOTO")
-    info("Este equipo accede al NAS desde fuera de la oficina.")
+    title("CONFIGURAR EQUIPO — ACCESO DESDE FUERA DE LA OFICINA")
+    info("Este computador va a poder entrar al NAS aunque no esté en la oficina.")
 
-    # Tailscale — siempre
     info("")
     if _tailscale_instalado():
         if _tailscale_activo():
-            ok("Tailscale instalado y activo.")
+            ok("Tailscale ya está instalado y funcionando.")
         else:
-            ok("Tailscale instalado pero sin sesión.")
-            info("Iniciando sesión — se abrirá el browser.")
+            ok("Tailscale ya está instalado pero falta iniciar sesión.")
+            info("Se abrirá el navegador para que inicies sesión.")
             info("Usa la cuenta Google de Ensamble que te asignaron.")
             _tailscale_login()
     else:
         _instalar_tailscale()
 
-    # Synology Drive — siempre
     drive_ok = _synodrive_instalado()
     info("")
     if drive_ok:
@@ -877,28 +861,20 @@ def _configurar_externo():
     else:
         _instalar_synology_drive()
 
-    # Alias en hosts — opcional (solo útil si a veces van a la oficina)
-    info("")
-    if _hosts_tiene_alias():
-        ok(f"Alias '{NAS_HOST_ALIAS}' ya existe en hosts.")
-    elif confirm("¿Agregar alias 'nas_local' en hosts? (solo necesario si a veces vas a la oficina)"):
-        _agregar_hosts()
-
     info("")
     ok("Configuración completada.")
 
-def seccion_configurar():
-    """Detecta red y configura el equipo según contexto. Requiere admin — se auto-eleva."""
+def seccion_configurar(ubicacion):
+    """Configura el equipo para el módulo elegido. Requiere administrador — se auto-eleva."""
     if not is_admin():
-        info("Esta sección requiere permisos de administrador.")
+        info("Esta parte necesita permisos de administrador.")
         if OS == "Windows":
-            info("Se abrirá una nueva ventana con permisos de administrador.")
-            info("Completa la configuración allí y luego regresa a esta ventana.")
-        _elevar_para_configurar()
+            info("Se abrirá una nueva ventana pidiendo permiso de administrador.")
+            info("Complétala ahí y luego vuelve a esta ventana.")
+        _elevar_para_configurar(ubicacion)
         return
 
-    red = detectar_red()
-    if red == "lan":
+    if ubicacion == "oficina":
         _configurar_lan()
     else:
         _configurar_externo()
@@ -913,7 +889,7 @@ def resumen_final(ubicacion, capas, resultado):
     por_capa = {c["capa"]: c for c in capas}
     title("RESUMEN")
 
-    info(f"Estás en: {'la oficina' if oficina else 'fuera de la oficina'}.")
+    info(f"Módulo: {'red de la oficina' if oficina else 'acceso fuera de la oficina'}.")
 
     # Qué quedó funcionando
     verdes = [c for c in capas if c["estado"] == VERDE]
@@ -932,9 +908,9 @@ def resumen_final(ubicacion, capas, resultado):
 
     # Qué se hizo hoy
     if resultado.get("acciones"):
-        nombres = {"configurar": "Configuración de componentes (Tailscale / Synology Drive / alias)",
-                   "reconectar_synodrive": "Guía para reconectar Synology Drive",
-                   "conectar": "Montaje de la carpeta de red"}
+        nombres = {"configurar": "Se instaló/configuró lo que faltaba",
+                   "reconectar_synodrive": "Se mostró la guía para reconectar Synology Drive",
+                   "conectar": "Se conectó la carpeta compartida"}
         info("")
         info("Qué se hizo hoy:")
         for a in resultado["acciones"]:
@@ -943,41 +919,40 @@ def resumen_final(ubicacion, capas, resultado):
         info("")
         warn(resultado["nota"])
 
-    # Cómo entrar al NAS — solo las vías que aplican
+    # Cómo entrar al NAS — solo la vía que aplica a este módulo
     info("")
     info("CÓMO ENTRAR AL NAS:")
-    n = 1
     if oficina:
-        destino = f"{DRIVE_ENSAMBLE} (unidad de red)" if OS == "Windows" else "/Volumes/Ensamble"
-        print(f"     {n}. Carpeta de red: {destino} — lo más cómodo, dentro de la oficina.")
-        n += 1
-        print(f"     {n}. Navegador en oficina: http://{NAS_HOST_ALIAS}:{DSM_HTTP_PORT}  (REQUIERE el puerto)")
-        print(f"        Con https://{NAS_HOST_ALIAS}:{DSM_HTTPS_PORT} sale una advertencia de certificado:")
+        destino = DRIVE_ENSAMBLE if OS == "Windows" else "/Volumes/Ensamble"
+        print(f"     1. Carpeta compartida: {destino} — así ves los archivos del NAS como una")
+        print(f"        carpeta más de tu computador. Lo más cómodo, dentro de la oficina.")
+        print(f"     2. Por navegador, dentro de la oficina: http://{NAS_HOST_ALIAS}:{DSM_HTTP_PORT}")
+        print(f"        Si escribes https en vez de http sale una advertencia de seguridad:")
         print(f"        es normal en la red local → \"Avanzado → Continuar\".")
-        n += 1
-    ts = por_capa.get("Tailscale")
-    if ts and ts["estado"] == VERDE:
-        print(f"     {n}. Navegador desde cualquier lugar (Tailscale activo):")
-        print(f"        https://{NAS_EXTERNAL_URL}  (sin puerto, candado verde válido).")
     else:
-        print(f"     {n}. Desde fuera de la oficina: activa Tailscale y entra a")
-        print(f"        https://{NAS_EXTERNAL_URL}  (sin puerto, candado verde).")
+        ts = por_capa.get("Tailscale")
+        if ts and ts["estado"] == VERDE:
+            print(f"     1. Por navegador, desde cualquier lugar (Tailscale activo):")
+            print(f"        https://{NAS_EXTERNAL_URL}  (sin puerto, candado verde válido).")
+        else:
+            print(f"     1. Activa Tailscale y luego entra por el navegador a")
+            print(f"        https://{NAS_EXTERNAL_URL}  (sin puerto, candado verde).")
 
     info("")
     info("Si algo deja de conectar, vuelve a abrir este programa:")
-    info("se diagnostica solo y te dice qué hacer.")
+    info("se revisa solo y te dice qué hacer.")
 
 
 # ─────────────────────────────────────────────
 # FLUJOS DE ENTRADA
 # ─────────────────────────────────────────────
 
-def flujo_diagnostico():
+def flujo_diagnostico(ubicacion):
     so_label = "Windows" if OS == "Windows" else "macOS"
-    title(f"ENSAMBLE — NAS  ·  {so_label}")
-    info("Diagnóstico automático de tu conexión al NAS.")
+    modulo_label = "RED DE LA OFICINA" if ubicacion == "oficina" else "ACCESO FUERA DE LA OFICINA"
+    title(f"ENSAMBLE — NAS  ·  {so_label}  ·  {modulo_label}")
+    info("Revisando tu conexión al NAS...")
 
-    ubicacion = detectar_ubicacion()
     capas = diagnosticar(ubicacion)
     imprimir_tarjeta(capas)
 
@@ -1002,7 +977,7 @@ def menu_clasico():
         title(f"ENSAMBLE — NAS  ·  {so_label}  (modo manual)")
         print("  [1] Conectar NAS")
         print("  [2] Configurar equipo  (necesita admin)")
-        print("  [3] Diagnóstico automático")
+        print("  [3] Revisar la conexión")
         print("  [0] Salir\n")
         opcion = ask("Selecciona una opción", ["1", "2", "3", "0"])
         if opcion == "0":
@@ -1010,11 +985,11 @@ def menu_clasico():
             break
         try:
             if opcion == "1":
-                seccion_conectar()
+                seccion_conectar(elegir_modulo())
             elif opcion == "2":
-                seccion_configurar()
+                seccion_configurar(elegir_modulo())
             elif opcion == "3":
-                flujo_diagnostico()
+                flujo_diagnostico(elegir_modulo())
         except KeyboardInterrupt:
             warn("Cancelado.")
         input("\n  Presiona Enter para volver al menú...")
@@ -1035,9 +1010,16 @@ def main():
         )
         sys.exit(0)
 
-    # Modo configurar: re-lanzado con permisos de admin
+    # Modo configurar: re-lanzado con permisos de admin. El módulo viaja por línea de
+    # comandos (--oficina / --fuera) para que la ventana elevada no vuelva a preguntar.
     if "--configure" in sys.argv:
-        seccion_configurar()
+        if "--oficina" in sys.argv:
+            ubicacion = "oficina"
+        elif "--fuera" in sys.argv:
+            ubicacion = "fuera"
+        else:
+            ubicacion = elegir_modulo()
+        seccion_configurar(ubicacion)
         input("\n  Presiona Enter para cerrar...")
         return
 
@@ -1046,9 +1028,13 @@ def main():
         menu_clasico()
         return
 
-    # Por defecto: diagnóstico automático
+    # Por defecto: pregunta el módulo, lo resuelve, y ofrece dejar listo el otro
     try:
-        flujo_diagnostico()
+        modulo = elegir_modulo()
+        flujo_diagnostico(modulo)
+        otro = preguntar_otro_modulo(modulo)
+        if otro:
+            flujo_diagnostico(otro)
     except KeyboardInterrupt:
         warn("Cancelado.")
     input("\n  Presiona Enter para cerrar...")
