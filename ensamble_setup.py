@@ -88,13 +88,39 @@ def run(cmd, check=True, capture=False):
         kwargs["text"] = True
     return subprocess.run(cmd, **kwargs)
 
+def _quote_exe_path(cmd: str) -> str:
+    """Los UninstallString del registro y las rutas de ejecutables propios vienen sin
+    comillas — si la ruta tiene espacios (típico de "Program Files"), shell=True corta
+    el comando en el primer espacio y falla con '"C:\\Program" no reconocido'. Bug real
+    observado en producción (Carbon Insights, Autodesk Access, Autodesk AutoCAD 2025).
+    Si ya viene entre comillas, se deja igual."""
+    if cmd.startswith('"'):
+        return cmd
+    idx = cmd.lower().find('.exe')
+    if idx == -1:
+        return cmd
+    exe_part = cmd[:idx + 4]
+    if ' ' in exe_part:
+        return f'"{exe_part}"{cmd[idx + 4:]}'
+    return cmd
+
+
 def run_logged(cmd, accion: str, timeout: int = None, codigos_ok=(0,)) -> bool:
     """Ejecuta cmd (str con shell, o list de argv) y reporta éxito/fallo con la razón
     real (stderr o stdout) en vez de asumir éxito o fallar en silencio. 3010 (MSI:
     reinicio pendiente) se trata como éxito informativo, no fallo."""
+    kwargs = {}
+    if isinstance(cmd, str):
+        cmd = _quote_exe_path(cmd)
+        if OS == "Windows":
+            # cmd.exe no puede iniciar con cwd en una ruta UNC (ej. corriendo desde
+            # \\nas_local\Ensamble\...) — sin esto cae a C:\Windows con un aviso y a
+            # veces arrastra fallos de parseo aguas abajo. Bug real observado en
+            # producción. Se fija un cwd local estable.
+            kwargs['cwd'] = os.environ.get('SystemRoot', r'C:\Windows')
     try:
         result = subprocess.run(
-            cmd, shell=isinstance(cmd, str), capture_output=True, text=True, timeout=timeout,
+            cmd, shell=isinstance(cmd, str), capture_output=True, text=True, timeout=timeout, **kwargs
         )
     except subprocess.TimeoutExpired:
         warn(f'{accion}: timeout.')
@@ -776,8 +802,12 @@ VENDORS: dict = {
                 r'C:\Program Files (x86)\Common Files\Autodesk Shared\AdskLicensing\uninstall.exe',
                 r'C:\Program Files\Autodesk\AdskIdentityManager\uninstall.exe',
             ],
-            # Por si el uninstall.exe de AdskLicensing no desregistra el servicio.
-            'services_to_delete': ['AdskLicensingService'],
+            # AdskLicensingService: por si el uninstall.exe de AdskLicensing no lo
+            # desregistra. "Autodesk CER Service" y "Autodesk Access Service Host":
+            # nombres reales confirmados en producción (Get-Service) — mantenían
+            # cer.dll/cer.db/cer.log abiertos y bloqueaban el borrado de carpetas
+            # aunque el proceso ya no apareciera en Get-Process.
+            'services_to_delete': ['AdskLicensingService', 'Autodesk CER Service', 'Autodesk Access Service Host'],
             'processes': ['acad.exe', 'AdskLicensingService.exe', 'AdAppMgrSvc.exe', 'revit.exe'],
         },
     },
@@ -949,7 +979,9 @@ def _delete_registry_value(hive_name: str, subkey: str, value_name: str):
 
 
 def _service_exists(service_name: str) -> bool:
-    result = run(f'sc query {service_name}', check=False, capture=True)
+    # Comillas obligatorias — nombres de servicio de Autodesk vienen con espacios
+    # ("Autodesk CER Service"), sin ellas sc.exe interpreta argumentos extra.
+    result = run(f'sc query "{service_name}"', check=False, capture=True)
     return result.returncode == 0
 
 
@@ -1124,12 +1156,15 @@ def uninstall_vendor_win(vendor_id: str, found: dict, dry_run: bool):
             run_logged(str(exe), f'Desinstalador propio {exe}', timeout=180, codigos_ok=(0, 3010))
 
     for svc in found.get('services_to_delete', []):
-        info(f'  Eliminando servicio: {svc} (por si el desinstalador propio no lo desregistró)')
+        info(f'  Deteniendo y eliminando servicio: {svc}')
         if not dry_run:
-            # Si el desinstalador propio ya se lo llevó, "sc delete" falla con "servicio
-            # no existe" — resultado esperado, se reporta igual (veraz) pero no es un
-            # fallo real de esta sección.
-            run_logged(f'sc delete {svc}', f'Eliminar servicio {svc}')
+            # sc stop ANTES de sc delete — solo borrar el registro del servicio no
+            # libera los archivos que ya tiene abiertos (bug real: cer.dll/cer.db/
+            # cer.log seguían bloqueados y la carpeta Autodesk no se podía borrar en
+            # la misma corrida). Si ya está detenido, sc stop falla con "no está
+            # activo" — resultado esperado, no un fallo real de esta sección.
+            run_logged(f'sc stop "{svc}"', f'Detener servicio {svc}')
+            run_logged(f'sc delete "{svc}"', f'Eliminar servicio {svc}')
 
     for entry in found.get('registry', []):
         info(f'  Desinstalando: {entry["name"]}')
