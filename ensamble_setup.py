@@ -88,6 +88,28 @@ def run(cmd, check=True, capture=False):
         kwargs["text"] = True
     return subprocess.run(cmd, **kwargs)
 
+def run_logged(cmd, accion: str, timeout: int = None, codigos_ok=(0,)) -> bool:
+    """Ejecuta cmd (str con shell, o list de argv) y reporta éxito/fallo con la razón
+    real (stderr o stdout) en vez de asumir éxito o fallar en silencio. 3010 (MSI:
+    reinicio pendiente) se trata como éxito informativo, no fallo."""
+    try:
+        result = subprocess.run(
+            cmd, shell=isinstance(cmd, str), capture_output=True, text=True, timeout=timeout,
+        )
+    except subprocess.TimeoutExpired:
+        warn(f'{accion}: timeout.')
+        return False
+    except Exception as e:
+        warn(f'{accion}: error al ejecutar — {e}')
+        return False
+    if result.returncode not in codigos_ok:
+        motivo = (result.stderr or result.stdout or '').strip() or f'código de salida {result.returncode}'
+        warn(f'{accion}: {motivo}')
+        return False
+    if result.returncode == 3010:
+        info(f'{accion}: correcto (reinicio pendiente).')
+    return True
+
 def is_admin():
     if OS == "Windows":
         try:
@@ -274,15 +296,18 @@ def crear_cuenta_admin_alineada(nombre: str):
 
     info("Forzando creación del perfil de usuario (tarea programada temporal)...")
     task_name = "EnsambleSetupInitProfile"
-    run(
+    creada = run_logged(
         f'schtasks /create /tn "{task_name}" /tr "cmd.exe /c whoami" /sc once /st 23:59 '
         f'/ru "{nombre}" /rp "{password}" /f',
-        check=False, capture=True,
+        f'Crear tarea temporal "{task_name}"',
     )
     del password
-    run(f'schtasks /run /tn "{task_name}"', check=False, capture=True)
-    time.sleep(5)
-    run(f'schtasks /delete /tn "{task_name}" /f', check=False, capture=True)
+    if creada:
+        run_logged(f'schtasks /run /tn "{task_name}"', f'Ejecutar tarea temporal "{task_name}"')
+        time.sleep(5)
+        run_logged(f'schtasks /delete /tn "{task_name}" /f', f'Eliminar tarea temporal "{task_name}"')
+    else:
+        warn("No se forzó la creación del perfil — la tarea temporal no se pudo crear.")
 
     perfil = Path(f"C:/Users/{nombre}")
     if perfil.exists():
@@ -402,14 +427,21 @@ def seccion_eliminar_cuenta_desuso():
         info("Cancelado.")
         return
 
-    run(f'powershell -Command "Remove-LocalUser -Name \'{objetivo}\'"', check=False)
+    if not run_logged(f'powershell -Command "Remove-LocalUser -Name \'{objetivo}\'"', f'Eliminar cuenta "{objetivo}"'):
+        return
+
     carpeta = Path(f"C:/Users/{objetivo}")
+    carpeta_ok = True
     if carpeta.exists():
         try:
-            shutil.rmtree(carpeta, ignore_errors=True)
+            shutil.rmtree(carpeta)
         except Exception as e:
-            warn(f"No se pudo eliminar la carpeta: {e}")
-    ok(f"Cuenta '{objetivo}' y su carpeta eliminadas.")
+            carpeta_ok = False
+            warn(f"Cuenta eliminada, pero no se pudo eliminar la carpeta {carpeta}: {e}")
+    if carpeta_ok:
+        ok(f"Cuenta '{objetivo}' y su carpeta eliminadas.")
+    else:
+        ok(f"Cuenta '{objetivo}' eliminada (carpeta pendiente — ver warning arriba).")
 
 
 def seccion_nombre_equipo():
@@ -515,10 +547,10 @@ def seccion_bloatware_servicios():
             if instalado:
                 if dry_run:
                     info(f"  [DRY-RUN] Se removería: {pkg}")
-                else:
-                    run(f'powershell -Command "Get-AppxPackage {pkg} | Remove-AppxPackage"', check=False)
+                    removidos += 1
+                elif run_logged(f'powershell -Command "Get-AppxPackage {pkg} | Remove-AppxPackage"', f'Remover {pkg}'):
                     info(f"  Removido: {pkg}")
-                removidos += 1
+                    removidos += 1
             else:
                 no_encontrados += 1
         verbo = "se removerían" if dry_run else "removido(s)"
@@ -535,8 +567,7 @@ def seccion_bloatware_servicios():
         if onedrive_exe:
             if dry_run:
                 info(f"  [DRY-RUN] Se ejecutaría: \"{onedrive_exe}\" /uninstall")
-            else:
-                run(f'"{onedrive_exe}" /uninstall', check=False)
+            elif run_logged(f'"{onedrive_exe}" /uninstall', 'Desinstalar OneDrive'):
                 info("  OneDrive desinstalado.")
         else:
             info("  OneDrive no está instalado (no se encontró OneDriveSetup.exe).")
@@ -556,17 +587,20 @@ def seccion_bloatware_servicios():
         if dry_run:
             info("[DRY-RUN] Se deshabilitarían los servicios SysMain y DiagTrack.")
         else:
-            run(
+            sysmain_ok = run_logged(
                 'powershell -Command "Set-Service SysMain -StartupType Disabled; '
                 'Stop-Service SysMain -ErrorAction SilentlyContinue"',
-                check=False,
+                'Deshabilitar SysMain',
             )
-            run(
+            diagtrack_ok = run_logged(
                 'powershell -Command "Set-Service DiagTrack -StartupType Disabled; '
                 'Stop-Service DiagTrack -ErrorAction SilentlyContinue"',
-                check=False,
+                'Deshabilitar DiagTrack',
             )
-            ok("SysMain y DiagTrack deshabilitados.")
+            if sysmain_ok:
+                ok("SysMain deshabilitado.")
+            if diagtrack_ok:
+                ok("DiagTrack deshabilitado.")
 
     if dry_run:
         ok("Sección bloatware y servicios: simulación completa. Sin cambios realizados.")
@@ -665,9 +699,22 @@ VENDORS: dict = {
                 r'C:\Program Files\Adobe',
                 r'C:\Program Files (x86)\Adobe',
                 r'C:\Program Files\Common Files\Adobe',
+                r'C:\Program Files (x86)\Common Files\Adobe',  # faltaba el par x86
                 r'C:\ProgramData\Adobe',
+                # AppData por-usuario — verificado contra guía community Adobe CC
+                # (photographylife.com). Resuelto por env var en scan_vendor_win.
+                r'%LOCALAPPDATA%\Adobe',
+                r'%APPDATA%\Adobe',
             ],
-            'processes': ['Creative Cloud.exe', 'AdobeIPCBroker.exe', 'AdobeUpdateService.exe'],
+            # 'AdobeGCInvoker-1.0' (Run key) descartado: verificado en vivo contra una
+            # instalación real de Creative Cloud 2025 (ENS-WIN-LAP-07) que esa entrada
+            # de arranque no existe — el mecanismo parece obsoleto en versiones actuales.
+            # CCXProcess.exe (Adobe Creative Cloud Experience) sí se confirmó corriendo
+            # en esa misma verificación — es el proceso real a matar, no uno adivinado.
+            'processes': [
+                'Creative Cloud.exe', 'AdobeIPCBroker.exe', 'AdobeUpdateService.exe',
+                'CCXProcess.exe',
+            ],
         },
     },
 
@@ -692,6 +739,11 @@ VENDORS: dict = {
         },
         'win': {
             'keywords': ['Autodesk', 'AutoCAD', 'Revit', 'Maya', '3ds Max', 'Navisworks'],
+            # "Autodesk Genuine Service" coincide con el keyword 'Autodesk' pero debe
+            # desinstalarse AL FINAL, después de limpiar registro y carpetas — si corre
+            # en la misma pasada puede dejar residuos que confunden al resto de la
+            # limpieza (ver uninstall_vendor_win → found['registry_deferred']).
+            'exclude_keywords': ['Genuine Service'],
             'path_globs': [
                 r'C:\Program Files\Autodesk',
                 r'C:\Program Files (x86)\Autodesk',
@@ -701,7 +753,31 @@ VENDORS: dict = {
                 # corregido aquí. No se propagó a ese script standalone (fuera de scope).
                 r'C:\Program Files\Common Files\Autodesk Shared',
                 r'C:\Program Files (x86)\Common Files\Autodesk Shared',
+                # AppData por-usuario y licencias FLEXnet — verificado contra
+                # documentación oficial Autodesk (Clean-uninstall.html). FLEXnet son
+                # 3 archivos (uno oculto), resueltos por glob en scan_vendor_win.
+                r'%LOCALAPPDATA%\Autodesk',
+                r'%APPDATA%\Autodesk',
+                r'C:\ProgramData\FLEXnet\adsk*.*',
             ],
+            # Borrado directo de claves — más allá de las entradas Uninstall estándar.
+            'registry_keys': [
+                ('HKLM', r'SOFTWARE\Autodesk'),
+                ('HKCU', r'SOFTWARE\Autodesk'),
+            ],
+            # Desinstaladores propios de Autodesk — correr ANTES de borrar carpetas
+            # (no solo taskkill + rmtree). El script ya corre elevado (require_admin()
+            # en main()), no hace falta re-elevar. Sin flags de silencio: no
+            # confirmados en la documentación citada por la tarea — si el instalador
+            # pide interacción, verificar los flags con Autodesk antes de dejarlo
+            # desatendido.
+            'custom_uninstallers': [
+                r'C:\Program Files\Autodesk\AdODIS\V1\RemoveODIS.exe',
+                r'C:\Program Files (x86)\Common Files\Autodesk Shared\AdskLicensing\uninstall.exe',
+                r'C:\Program Files\Autodesk\AdskIdentityManager\uninstall.exe',
+            ],
+            # Por si el uninstall.exe de AdskLicensing no desregistra el servicio.
+            'services_to_delete': ['AdskLicensingService'],
             'processes': ['acad.exe', 'AdskLicensingService.exe', 'AdAppMgrSvc.exe', 'revit.exe'],
         },
     },
@@ -804,17 +880,115 @@ def scan_vendor_mac(vendor_id: str) -> dict:
     return found
 
 
+# ─── Helpers de registro y rutas (Windows) ──────────────────────────
+
+_HIVES = {'HKLM': winreg.HKEY_LOCAL_MACHINE, 'HKCU': winreg.HKEY_CURRENT_USER} if winreg else {}
+
+
+def _resolve_win_path_glob(path_str: str) -> list:
+    """Expande variables de entorno (%LOCALAPPDATA%, %APPDATA%, etc.) y, si el patrón
+    trae wildcards, resuelve por glob. Sin wildcards es una comprobación de existencia
+    directa — mismo comportamiento que antes para las rutas planas ya registradas."""
+    expanded = os.path.expandvars(path_str)
+    if any(ch in expanded for ch in '*?['):
+        return [Path(p) for p in glob.glob(expanded)]
+    p = Path(expanded)
+    return [p] if p.exists() else []
+
+
+def _registry_key_exists(hive_name: str, subkey: str) -> bool:
+    hive = _HIVES.get(hive_name)
+    if hive is None:
+        return False
+    try:
+        with winreg.OpenKey(hive, subkey):
+            return True
+    except OSError:
+        return False
+
+
+def _registry_value_exists(hive_name: str, subkey: str, value_name: str) -> bool:
+    hive = _HIVES.get(hive_name)
+    if hive is None:
+        return False
+    try:
+        with winreg.OpenKey(hive, subkey) as key:
+            winreg.QueryValueEx(key, value_name)
+        return True
+    except OSError:
+        return False
+
+
+def _delete_registry_key_recursive(hive_name: str, subkey: str):
+    """DeleteKey falla si la clave tiene subclaves — hay que vaciarla primero."""
+    hive = _HIVES.get(hive_name)
+    if hive is None:
+        return
+    try:
+        with winreg.OpenKey(hive, subkey, 0, winreg.KEY_ALL_ACCESS) as key:
+            while True:
+                try:
+                    sub = winreg.EnumKey(key, 0)
+                except OSError:
+                    break
+                _delete_registry_key_recursive(hive_name, f'{subkey}\\{sub}')
+        winreg.DeleteKey(hive, subkey)
+    except OSError as e:
+        warn(f'    No se pudo eliminar la clave {hive_name}\\{subkey}: {e}')
+
+
+def _delete_registry_value(hive_name: str, subkey: str, value_name: str):
+    hive = _HIVES.get(hive_name)
+    if hive is None:
+        return
+    try:
+        with winreg.OpenKey(hive, subkey, 0, winreg.KEY_SET_VALUE) as key:
+            winreg.DeleteValue(key, value_name)
+    except OSError as e:
+        warn(f'    No se pudo eliminar el valor {hive_name}\\{subkey}\\{value_name}: {e}')
+
+
+def _service_exists(service_name: str) -> bool:
+    result = run(f'sc query {service_name}', check=False, capture=True)
+    return result.returncode == 0
+
+
+def _run_uninstall_string(entry: dict) -> bool:
+    """Ejecuta el UninstallString de una entrada de registro, agregando flags de
+    silencio cuando faltan. Compartido por el pase normal y el diferido (Genuine Service)."""
+    cmd = entry.get('uninstall')
+    if not cmd:
+        warn(f'    "{entry.get("name", "?")}" no tiene UninstallString registrada — no se puede desinstalar automáticamente.')
+        return False
+    if 'msiexec' in cmd.lower():
+        if '/quiet' not in cmd.lower():
+            cmd += ' /quiet /norestart'
+    elif '/S' not in cmd and '/silent' not in cmd.lower() and '/quiet' not in cmd.lower():
+        cmd += ' /S'
+    return run_logged(cmd, f'Desinstalar "{entry["name"]}"', timeout=180, codigos_ok=(0, 3010))
+
+
 def scan_vendor_win(vendor_id: str) -> dict:
-    found: dict = {'registry': [], 'paths': []}
+    found: dict = {
+        'registry': [],
+        'registry_deferred': [],
+        'paths': [],
+        'registry_keys': [],
+        'registry_run_keys': [],
+        'custom_uninstallers': [],
+        'services_to_delete': [],
+    }
     profile = VENDORS[vendor_id]['win']
 
     if winreg:
         keywords = profile.get('keywords', [])
+        exclude_keywords = profile.get('exclude_keywords', [])
         hives = [
             (winreg.HKEY_LOCAL_MACHINE, r'SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall'),
             (winreg.HKEY_LOCAL_MACHINE, r'SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall'),
             (winreg.HKEY_CURRENT_USER, r'SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall'),
         ]
+        hive_names = {winreg.HKEY_LOCAL_MACHINE: 'HKLM', winreg.HKEY_CURRENT_USER: 'HKCU'}
         for hive, key_path in hives:
             try:
                 with winreg.OpenKey(hive, key_path) as key:
@@ -829,9 +1003,27 @@ def scan_vendor_win(vendor_id: str) -> dict:
                                             uninstall_str = winreg.QueryValueEx(subkey, 'UninstallString')[0]
                                         except OSError:
                                             uninstall_str = ''
-                                        entry = {'name': name, 'uninstall': uninstall_str}
-                                        if entry not in found['registry']:
-                                            found['registry'].append(entry)
+                                        # hive/subkey_full guardados para poder borrar esta
+                                        # entrada de Uninstall después, sin importar si el
+                                        # UninstallString existe o funciona — antes esto no
+                                        # se guardaba y las entradas fantasma (UninstallString
+                                        # vacío, ej. "AutoCAD 2025 - English") sobrevivían para
+                                        # siempre porque nunca se intentaba nada con ellas.
+                                        entry = {
+                                            'name': name,
+                                            'uninstall': uninstall_str,
+                                            'hive': hive_names[hive],
+                                            'subkey_full': f'{key_path}\\{subkey_name}',
+                                        }
+                                        # Ej. "Autodesk Genuine Service" — desinstalar al
+                                        # final (ver uninstall_vendor_win), no en esta pasada.
+                                        target = (
+                                            found['registry_deferred']
+                                            if any(ex.lower() in name.lower() for ex in exclude_keywords)
+                                            else found['registry']
+                                        )
+                                        if entry not in target:
+                                            target.append(entry)
                                 except OSError:
                                     pass
                         except OSError:
@@ -840,11 +1032,26 @@ def scan_vendor_win(vendor_id: str) -> dict:
                 continue
 
     for path_str in profile.get('path_globs', []):
-        p = Path(path_str)
-        if p.exists():
-            found['paths'].append(p)
+        found['paths'].extend(_resolve_win_path_glob(path_str))
 
-    found['_total'] = len(found['registry']) + len(found['paths'])
+    for hive_name, subkey in profile.get('registry_keys', []):
+        if _registry_key_exists(hive_name, subkey):
+            found['registry_keys'].append({'hive': hive_name, 'subkey': subkey})
+
+    for hive_name, subkey, value_name in profile.get('registry_run_keys', []):
+        if _registry_value_exists(hive_name, subkey, value_name):
+            found['registry_run_keys'].append({'hive': hive_name, 'subkey': subkey, 'value': value_name})
+
+    for exe_path in profile.get('custom_uninstallers', []):
+        p = Path(exe_path)
+        if p.exists():
+            found['custom_uninstallers'].append(p)
+
+    for svc in profile.get('services_to_delete', []):
+        if _service_exists(svc):
+            found['services_to_delete'].append(svc)
+
+    found['_total'] = sum(len(v) for k, v in found.items() if k != '_total')
     return found
 
 
@@ -871,13 +1078,16 @@ def uninstall_vendor_mac(vendor_id: str, found: dict, dry_run: bool):
     for path in found.get('launch_daemons', []):
         info(f'  Descargando daemon: {path.name}')
         if not dry_run:
-            subprocess.run(['launchctl', 'bootout', 'system', str(path)], capture_output=True)
-            subprocess.run(['launchctl', 'unload', str(path)], capture_output=True)
+            # bootout puede fallar con un código "no cargado" si el daemon ya no está
+            # activo — no fabrico ese código exacto (no confirmado), así que se reporta
+            # igual que cualquier otro fallo; es información veraz aunque sea benigna.
+            run_logged(['launchctl', 'bootout', 'system', str(path)], f'Bootout daemon {path.name}')
+            run_logged(['launchctl', 'unload', str(path)], f'Unload daemon {path.name}')
 
     for path in found.get('launch_agents', []):
         info(f'  Descargando agente: {path.name}')
         if not dry_run:
-            subprocess.run(['launchctl', 'unload', str(path)], capture_output=True)
+            run_logged(['launchctl', 'unload', str(path)], f'Unload agente {path.name}')
 
     all_paths = (
         found.get('apps', []) + found.get('dirs', [])
@@ -888,16 +1098,16 @@ def uninstall_vendor_mac(vendor_id: str, found: dict, dry_run: bool):
         if not dry_run:
             try:
                 if path.is_dir():
-                    shutil.rmtree(path, ignore_errors=True)
-                else:
-                    path.unlink(missing_ok=True)
+                    shutil.rmtree(path)
+                elif path.exists():
+                    path.unlink()
             except Exception as e:
                 warn(f'    No se pudo eliminar {path}: {e}')
 
     for pkg in found.get('packages', []):
         info(f'  Olvidando paquete: {pkg}')
         if not dry_run:
-            subprocess.run(['pkgutil', '--forget', pkg], capture_output=True)
+            run_logged(['pkgutil', '--forget', pkg], f'Olvidar paquete {pkg}')
 
 
 def uninstall_vendor_win(vendor_id: str, found: dict, dry_run: bool):
@@ -908,29 +1118,60 @@ def uninstall_vendor_win(vendor_id: str, found: dict, dry_run: bool):
     if not dry_run:
         kill_processes_win(profile.get('processes', []))
 
+    for exe in found.get('custom_uninstallers', []):
+        info(f'  Ejecutando desinstalador propio: {exe}')
+        if not dry_run:
+            run_logged(str(exe), f'Desinstalador propio {exe}', timeout=180, codigos_ok=(0, 3010))
+
+    for svc in found.get('services_to_delete', []):
+        info(f'  Eliminando servicio: {svc} (por si el desinstalador propio no lo desregistró)')
+        if not dry_run:
+            # Si el desinstalador propio ya se lo llevó, "sc delete" falla con "servicio
+            # no existe" — resultado esperado, se reporta igual (veraz) pero no es un
+            # fallo real de esta sección.
+            run_logged(f'sc delete {svc}', f'Eliminar servicio {svc}')
+
     for entry in found.get('registry', []):
         info(f'  Desinstalando: {entry["name"]}')
-        if not dry_run and entry['uninstall']:
-            cmd = entry['uninstall']
-            if 'msiexec' in cmd.lower():
-                if '/quiet' not in cmd.lower():
-                    cmd += ' /quiet /norestart'
-            elif '/S' not in cmd and '/silent' not in cmd.lower() and '/quiet' not in cmd.lower():
-                cmd += ' /S'
-            try:
-                subprocess.run(cmd, shell=True, timeout=180, capture_output=True)
-            except subprocess.TimeoutExpired:
-                warn(f'    Timeout desinstalando: {entry["name"]}')
-            except Exception as e:
-                warn(f'    Error: {e}')
+        if not dry_run:
+            _run_uninstall_string(entry)
+            # Se borra la entrada de Uninstall pase lo que pase con el comando de
+            # arriba (existiera o no, tuviera éxito o no) — de lo contrario entradas
+            # como "AutoCAD 2025 - English" (UninstallString vacío) quedan fantasma
+            # en Programas y Características para siempre, verificado en un equipo real.
+            _delete_registry_key_recursive(entry['hive'], entry['subkey_full'])
+
+    for item in found.get('registry_run_keys', []):
+        display = f'{item["hive"]}\\{item["subkey"]}\\{item["value"]}'
+        info(f'  Eliminando entrada de arranque: {display}')
+        if not dry_run:
+            _delete_registry_value(item['hive'], item['subkey'], item['value'])
 
     for path in found.get('paths', []):
-        info(f'  Eliminando carpeta: {path}')
+        info(f'  Eliminando: {path}')
         if not dry_run:
             try:
-                shutil.rmtree(path, ignore_errors=True)
+                if path.is_dir():
+                    shutil.rmtree(path)
+                else:
+                    path.unlink()
             except Exception as e:
                 warn(f'    No se pudo eliminar {path}: {e}')
+
+    for item in found.get('registry_keys', []):
+        display = f'{item["hive"]}\\{item["subkey"]}'
+        info(f'  Eliminando clave de registro: {display}')
+        if not dry_run:
+            _delete_registry_key_recursive(item['hive'], item['subkey'])
+
+    # exclude_keywords (ej. "Genuine Service") se desinstala AL FINAL, después de
+    # limpiar registro y carpetas — correrlo antes puede dejar residuos que
+    # confunden al resto de la limpieza.
+    for entry in found.get('registry_deferred', []):
+        info(f'  Desinstalando (al final): {entry["name"]}')
+        if not dry_run:
+            _run_uninstall_string(entry)
+            _delete_registry_key_recursive(entry['hive'], entry['subkey_full'])
 
 
 LINE = '─' * 56
@@ -1105,7 +1346,7 @@ def seccion_software_basico():
         if result.returncode == 0:
             ok(f"{nombre} instalado.")
         else:
-            err(f"{nombre} — winget devolvió código {result.returncode}. Revisa manualmente.")
+            err(f"{nombre} — winget devolvió código {result.returncode} (ver el mensaje de winget arriba).")
 
     ok("\nSección software básico completada.")
 
@@ -1185,8 +1426,10 @@ def _bloquear_exe_firewall(exe_path, dry_run: bool = False) -> bool:
     if _rule_exists(rule_name):
         return False
     if not dry_run:
-        run(f'netsh advfirewall firewall add rule name="{rule_name}" dir=out program="{exe_path}" action=block', check=False)
-        run(f'netsh advfirewall firewall add rule name="{rule_name}" dir=in program="{exe_path}" action=block', check=False)
+        ok_out = run_logged(f'netsh advfirewall firewall add rule name="{rule_name}" dir=out program="{exe_path}" action=block', f'Bloquear salida {exe_path}')
+        ok_in = run_logged(f'netsh advfirewall firewall add rule name="{rule_name}" dir=in program="{exe_path}" action=block', f'Bloquear entrada {exe_path}')
+        if not (ok_out and ok_in):
+            warn(f'    {exe_path} quedó parcial o totalmente sin bloquear.')
     return True
 
 
@@ -1231,14 +1474,15 @@ def _instalar_tarea_reaplicar(exe_paths: list) -> bool:
     REAPLICAR_DIR.mkdir(parents=True, exist_ok=True)
     REAPLICAR_SCRIPT.write_text(_generar_ps_reaplicar(exe_paths), encoding="utf-8")
 
+    # El delete previo puede fallar si la tarea no existía todavía — esperado, no se
+    # reporta como fallo de esta función (solo importa el resultado del create).
     run(f'schtasks /delete /tn "{REAPLICAR_TASK}" /f', check=False, capture=True)
-    result = run(
+    return run_logged(
         f'schtasks /create /tn "{REAPLICAR_TASK}" '
         f'/tr "powershell -ExecutionPolicy Bypass -File \\"{REAPLICAR_SCRIPT}\\"" '
         f'/sc daily /st 09:00 /ru SYSTEM /rl HIGHEST /f',
-        check=False, capture=True,
+        f'Crear tarea "{REAPLICAR_TASK}"',
     )
-    return result.returncode == 0
 
 
 def seccion_aislar_software_profesional():
@@ -1262,8 +1506,8 @@ def seccion_aislar_software_profesional():
         if dry_run:
             info("[DRY-RUN] Se activaría en los 3 perfiles (Dominio/Privado/Público).")
         elif confirm("¿Activarlo ahora (Dominio/Privado/Público)?"):
-            run('netsh advfirewall set allprofiles state on', check=False)
-            ok("Firewall activado en los 3 perfiles.")
+            if run_logged('netsh advfirewall set allprofiles state on', 'Activar firewall (3 perfiles)'):
+                ok("Firewall activado en los 3 perfiles.")
         else:
             warn("Sin el firewall activo, las reglas de bloqueo no tienen efecto. Continuando de todos modos...")
 
@@ -1291,11 +1535,16 @@ def seccion_aislar_software_profesional():
     carpetas = _carpetas_a_bloquear(seleccion)
     info(f"\nBuscando ejecutables en {len(carpetas)} carpeta(s) conocida(s)...")
 
+    # Resuelto igual que scan_vendor_win (expandvars + glob) — path_globs puede traer
+    # %LOCALAPPDATA%/%APPDATA% o wildcards (ej. FLEXnet de Autodesk); sin esto, esas
+    # entradas se saltaban en silencio (Path() literal nunca las encontraba).
     encontrados = []
     for carpeta in carpetas:
-        p = Path(carpeta)
-        if p.exists():
-            encontrados.extend(p.rglob('*.exe'))
+        for p in _resolve_win_path_glob(carpeta):
+            if p.is_dir():
+                encontrados.extend(p.rglob('*.exe'))
+            elif p.suffix.lower() == '.exe':
+                encontrados.append(p)
 
     if not encontrados:
         ok("No se encontraron ejecutables en las carpetas de los proveedores seleccionados.")
@@ -1334,7 +1583,7 @@ def seccion_aislar_software_profesional():
             ok(f"Tarea '{REAPLICAR_TASK}' creada — corre diario a las 09:00 como SYSTEM.")
             info(f"Script: {REAPLICAR_SCRIPT}")
         else:
-            err("No se pudo crear la tarea programada. Revisa permisos y vuelve a intentar.")
+            err("No se pudo crear la tarea programada (ver el motivo arriba).")
 
 
 # ─────────────────────────────────────────────
@@ -1357,8 +1606,7 @@ def seccion_configuracion_inicial():
         linea_guid = next((l for l in estado.splitlines() if ALTO_RENDIMIENTO_GUID in l), "")
         if "*" in linea_guid:
             ok("Ya estaba activo — sin cambios.")
-        else:
-            run(f"powercfg /setactive {ALTO_RENDIMIENTO_GUID}", check=False)
+        elif run_logged(f"powercfg /setactive {ALTO_RENDIMIENTO_GUID}", "Activar plan 'Alto rendimiento'"):
             ok("Plan 'Alto rendimiento' activado.")
 
     ok("Sección configuración inicial completada.")
