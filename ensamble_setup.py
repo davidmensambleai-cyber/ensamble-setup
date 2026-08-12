@@ -1348,12 +1348,50 @@ SOFTWARE_BASICO_WINGET = [
     ("Visual Studio Code", "Microsoft.VisualStudioCode"),
 ]
 
+# VS Code anclado a la barra de tareas, abriendo directo el proyecto — ver
+# asesor-ti/fixes/vscode-taskbar-abre-proyecto.md. Misma unidad de red (Z:) que monta
+# mount-nas.py en todo equipo Windows conectado a la red local — ruta fija, no por equipo.
+RUTA_PROYECTO_WIN = r"Z:\DTI_Tecnología, innovación y optimización\ensamble-platform"
+VSCODE_LNK_PIN = os.path.join(
+    os.environ.get("APPDATA", ""),
+    "Microsoft", "Internet Explorer", "Quick Launch", "User Pinned", "TaskBar",
+    "Visual Studio Code.lnk",
+)
+
+
+def _anclar_vscode_proyecto():
+    """Edita el acceso directo YA anclado de VS Code para que abra directo el proyecto
+    (Argumentos = ruta del proyecto). No puede anclar VS Code de cero de forma confiable —
+    Windows no expone una API soportada para eso (mismo motivo por el que "Chrome
+    predeterminado" quedó descartado en este script, más abajo). Si todavía no está
+    anclado, solo da instrucciones."""
+    if not os.path.exists(VSCODE_LNK_PIN):
+        warn("VS Code todavía no está anclado a la barra de tareas.")
+        info("Para que abra el proyecto directo, ancla el ícono una vez:")
+        info('  1. Abre el menú Inicio y busca "Visual Studio Code".')
+        info('  2. Clic derecho sobre el resultado → "Anclar a la barra de tareas".')
+        info("  3. Vuelve a correr esta sección (Instalación → Software básico) —")
+        info("     el script completa el segundo paso (cargar el proyecto) solo.")
+        return
+
+    ps_script = (
+        f'$ws = New-Object -ComObject WScript.Shell; '
+        f'$sc = $ws.CreateShortcut("{VSCODE_LNK_PIN}"); '
+        f"$sc.Arguments = '\"{RUTA_PROYECTO_WIN}\"'; "
+        f'$sc.Save()'
+    )
+    if run_logged(["powershell", "-NoProfile", "-Command", ps_script], "Anclar VS Code al proyecto"):
+        ok("VS Code anclado ahora abre directo la carpeta del proyecto.")
+
 
 def seccion_software_basico():
     title("INSTALACIÓN · SOFTWARE BÁSICO")
 
     if not IS_WIN:
         warn("Esta sección usa winget (Windows). En Mac, instalar manualmente vía Homebrew — fuera de este alcance por ahora.")
+        info("VS Code en Mac no tiene un mecanismo de Dock con argumentos anclables — no automatizable")
+        info("desde este script. Abre el proyecto una vez (Cmd+O o File → Open Folder) y VS Code lo")
+        info("recuerda solo en los siguientes lanzamientos desde el Dock (window.restoreWindows, default).")
         return
 
     info("Fuente: config_parque_tecnologico.json → software.todos_los_equipos_ensamble")
@@ -1382,6 +1420,9 @@ def seccion_software_basico():
             ok(f"{nombre} instalado.")
         else:
             err(f"{nombre} — winget devolvió código {result.returncode} (ver el mensaje de winget arriba).")
+
+    print()
+    _anclar_vscode_proyecto()
 
     ok("\nSección software básico completada.")
 

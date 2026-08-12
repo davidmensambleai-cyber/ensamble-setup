@@ -625,7 +625,15 @@ def reconectar_synodrive():
 def _montar_unidad_win(letra, share, usuario, password, host=NAS_HOST_ALIAS):
     unc = f"\\\\{host}\\{share}"
     run(f'net use {letra} /delete /y', check=False, capture=True)
-    cmd = f'net use {letra} "{unc}" /persistent:yes /user:"{usuario}" "{password}"'
+    # cmdkey graba la credencial en el Administrador de credenciales de Windows de forma
+    # persistente, independiente del ciclo de vida de "net use". Sin esto, /persistent:yes
+    # solo marca la letra para reconectar al iniciar sesión, pero Windows puede no tener
+    # la credencial disponible en ese momento y vuelve a pedirla — confirmado real
+    # (usuario reportó que "recordar contraseña" no sobrevivía a un reinicio). Se borra y
+    # se vuelve a agregar en cada corrida para no dejar una credencial vieja si cambió.
+    run(f'cmdkey /delete:{host}', check=False, capture=True)
+    run(f'cmdkey /add:{host} /user:"{usuario}" /pass:"{password}"', check=False, capture=True)
+    cmd = f'net use {letra} "{unc}" /persistent:yes'
     result = run(cmd, check=False)
     if result.returncode == 0:
         ok(f"{letra} → {unc}")
