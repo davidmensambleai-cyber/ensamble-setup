@@ -49,6 +49,10 @@ SHARE_ARCHIVO     = "ARCHIVO ENSAMBLE"
 DRIVE_ENSAMBLE    = "Z:"
 DRIVE_ARCHIVO     = "Y:"
 NAS_ADMIN_USERS   = {"admin", "davidm", "juanpablop", "simonf"}
+# Nombre del tailnet compartido de Ensamble (CurrentTailnet.Name en `tailscale status --json`).
+# Es el mismo para todo el equipo aunque cada colaborador entre con su propia cuenta Google —
+# verificado en vivo contra el NAS 2026-08-19 (todo el User map del JSON comparte este tailnet).
+TAILSCALE_TAILNET_ESPERADO = "ensamble.dai@gmail.com"
 
 DSM_HTTP_PORT     = 5000
 DSM_HTTPS_PORT    = 5001
@@ -258,6 +262,28 @@ def _tailscale_login():
         return
     run(f'"{cli}" login', check=False)
 
+def _tailscale_identidad_correcta():
+    """
+    True/False si se pudo verificar, None si no (sin CLI, JSON inesperado, etc. — nunca
+    bloquea el diagnóstico por esto). Compara CurrentTailnet.Name, NO el correo individual
+    logueado: gerentes comparten ensamble.dai@gmail.com pero cada colaborador entra con su
+    propia cuenta Google — todos caen en el mismo tailnet compartido (verificado 2026-08-19).
+    """
+    cli = _tailscale_cli()
+    if not cli:
+        return None
+    r = run(f'"{cli}" status --json', check=False, capture=True)
+    if r.returncode != 0 or not r.stdout:
+        return None
+    try:
+        data = json.loads(r.stdout)
+        nombre = (data.get("CurrentTailnet") or {}).get("Name")
+        if not nombre:
+            return None
+        return nombre == TAILSCALE_TAILNET_ESPERADO
+    except Exception:
+        return None
+
 def _dns_resuelve(host, expected_ip):
     """(resuelve_a_esperado, conjunto_de_ips). Usa DNS público — no requiere Tailscale."""
     try:
@@ -441,7 +467,8 @@ def diagnosticar(ubicacion):
 
     if oficina:
         # ── Carpeta compartida del NAS ────────────────────────────
-        if _smb_montado():
+        montada = _smb_montado()
+        if montada:
             destino = DRIVE_ENSAMBLE if OS == "Windows" else f"/Volumes/{SHARE_ENSAMBLE}"
             capas.append(_capa("Carpeta compartida del NAS", VERDE, f"Ya está conectada en {destino}",
                                "así ves y guardas los archivos del NAS como una carpeta más de tu computador"))
@@ -449,6 +476,30 @@ def diagnosticar(ubicacion):
             capas.append(_capa("Carpeta compartida del NAS", ROJO, "Todavía no está conectada",
                                "así ves y guardas los archivos del NAS como una carpeta más de tu computador",
                                "conectar"))
+
+        # ── Credenciales guardadas + Reconexión automática (Windows, solo si ya montada) ──
+        # Separadas de la capa de arriba a propósito: si la unidad ya está montada, esta
+        # capa se ponía verde y escondía que cmdkey o la tarea de reconexión podían faltar
+        # (bug real detectado 2026-08-19 — Z: en verde, sin garantía de las otras dos).
+        if OS == "Windows" and montada:
+            if _cmdkey_tiene_credencial(NAS_HOST_ALIAS):
+                capas.append(_capa("Credenciales guardadas", VERDE,
+                                   "Guardadas — no debería volver a pedir la contraseña",
+                                   "para que Windows recuerde tu usuario y contraseña del NAS"))
+            else:
+                capas.append(_capa("Credenciales guardadas", ROJO, "Todavía no están guardadas",
+                                   "para que Windows recuerde tu usuario y contraseña del NAS",
+                                   "guardar_credenciales"))
+
+            if _reconexion_startup_existe():
+                capas.append(_capa("Reconexión automática", VERDE,
+                                   "Configurada — reintenta al iniciar sesión y revisa cada 10 min el resto del día",
+                                   "para que no tengas que volver a poner la contraseña si la red va lenta o se cae un momento"))
+            else:
+                capas.append(_capa("Reconexión automática", ROJO,
+                                   "Todavía no está configurada",
+                                   "para que no tengas que volver a poner la contraseña si la red va lenta o se cae un momento",
+                                   "crear_tarea_reconexion"))
 
         # ── Navegador dentro de la oficina ─────────────────────────
         if _hosts_tiene_alias():
@@ -467,6 +518,18 @@ def diagnosticar(ubicacion):
         if ts_peer:
             capas.append(_capa("Tailscale", VERDE, "Ya está funcionando — el NAS responde",
                                "el programa que te deja entrar al NAS aunque no estés en la oficina"))
+            # Cuenta correcta de Tailscale — separada de la capa de arriba: si el NAS
+            # responde pero el equipo está en OTRO tailnet (cuenta personal, otra empresa),
+            # el resto de capas puede verse verde por casualidad sin que esto sea real.
+            identidad = _tailscale_identidad_correcta()
+            if identidad is True:
+                capas.append(_capa("Cuenta de Tailscale", VERDE, "Conectado a la red de Ensamble",
+                                   "para confirmar que este equipo está en la red correcta y no en otra cuenta de Tailscale"))
+            elif identidad is False:
+                capas.append(_capa("Cuenta de Tailscale", ROJO,
+                                   "Conectado a OTRA red de Tailscale — no es la de Ensamble",
+                                   "para confirmar que este equipo está en la red correcta y no en otra cuenta de Tailscale",
+                                   None))
         elif not ts_inst:
             capas.append(_capa("Tailscale", ROJO, "Todavía no está instalado en este computador",
                                "el programa que te deja entrar al NAS aunque no estés en la oficina", "configurar"))
@@ -530,9 +593,10 @@ def imprimir_tarjeta(capas):
 
 def enrutar(capas, ubicacion):
     """
-    Decide y propone acciones según el diagnóstico. Devuelve dict con lo ejecutado.
-    Orden: configurar (requiere admin) → reconectar SynoDrive → conectar (carpeta compartida).
-    Cada acción pide confirmación.
+    Decide y propone acciones según el diagnóstico. Devuelve dict con lo ejecutado. Orden:
+    configurar (requiere admin) → reconectar SynoDrive → conectar (carpeta compartida) →
+    guardar credenciales → crear tarea de reconexión. Cada acción pide confirmación —
+    solo se ofrece lo que la capa correspondiente marcó como faltante, nunca de más.
     """
     resultado = {"acciones": [], "nota": None}
     acciones = {c["accion"] for c in capas if c["accion"]}
@@ -576,6 +640,20 @@ def enrutar(capas, ubicacion):
         if confirm("¿Conectar ahora la carpeta compartida del NAS?"):
             seccion_conectar(ubicacion)
             resultado["acciones"].append("conectar")
+
+    # 4) Guardar credenciales (Windows, unidad ya montada pero sin cmdkey) — no toca net use
+    if "guardar_credenciales" in acciones:
+        info("")
+        if confirm("¿Guardar tus credenciales del NAS ahora?"):
+            _guardar_credenciales_win()
+            resultado["acciones"].append("guardar_credenciales")
+
+    # 5) Configurar reconexión automática al iniciar sesión (Windows) — usa cmdkey
+    if "crear_tarea_reconexion" in acciones:
+        info("")
+        if confirm("¿Configurar la reconexión automática al iniciar sesión?"):
+            _instalar_reconexion_startup_win()
+            resultado["acciones"].append("crear_tarea_reconexion")
 
     return resultado
 
@@ -622,6 +700,106 @@ def reconectar_synodrive():
 # [1] CONECTAR NAS  (lógica existente — reusada)
 # ─────────────────────────────────────────────
 
+def _cmdkey_tiene_credencial(host):
+    """True si ya hay una credencial guardada para ese host en el Administrador de
+    credenciales de Windows."""
+    r = run('cmdkey /list', check=False, capture=True)
+    return host.lower() in (r.stdout or "").lower()
+
+def _unidad_asignada(letra):
+    """True si la letra tiene una asignación de red registrada (montada o no —
+    'No disponible' cuenta como asignada, distinto de nunca haberse configurado)."""
+    return run(f'net use {letra}', check=False, capture=True).returncode == 0
+
+def _startup_folder():
+    return os.path.join(os.environ.get("APPDATA", ""), "Microsoft", "Windows",
+                         "Start Menu", "Programs", "Startup")
+
+def _reconexion_startup_existe():
+    return os.path.exists(os.path.join(_startup_folder(), "EnsambleReconectarNAS.bat"))
+
+def _lineas_reconexion(chequear):
+    """
+    Genera las líneas `net use` para las unidades actualmente asignadas (Z: siempre,
+    Y: solo si corresponde a este usuario). Si chequear=True, cada línea se envuelve en
+    "if not exist letra:" — para el bucle periódico, que no debe tocar una unidad que ya
+    está conectada, solo reconectar la que de verdad se cayó. Si chequear=False,
+    reconecta sin condición — para el reintento de arranque, donde vale la pena forzar
+    el intento aunque el estado todavía no sea confiable tan temprano en el login.
+    """
+    incluye_z = _unidad_asignada(DRIVE_ENSAMBLE)
+    incluye_y = _unidad_asignada(DRIVE_ARCHIVO)
+    unc_z = f"\\\\{NAS_HOST_ALIAS}\\{SHARE_ENSAMBLE}"
+    unc_y = f"\\\\{NAS_LAN_IP}\\{SHARE_ARCHIVO}"
+    lineas = []
+    for incluye, letra, unc in ((incluye_z, DRIVE_ENSAMBLE, unc_z), (incluye_y, DRIVE_ARCHIVO, unc_y)):
+        if not incluye:
+            continue
+        cmd = f'net use {letra} "{unc}" /persistent:yes >nul 2>&1'
+        lineas.append(f'if not exist {letra}\\ ({cmd})' if chequear else cmd)
+    return lineas
+
+def _instalar_reconexion_startup_win():
+    """
+    Windows reconecta unidades persistentes muy temprano en el arranque, antes de que la
+    red/NetBIOS esté lista. Si esa primera reconexión silenciosa falla, la unidad queda
+    "desconectada" y Windows pide credenciales aunque cmdkey ya las tenga guardadas —
+    confirmado real (FIX-006, asesor-ti/fixes/reconexion-nas-boot-race-windows.md).
+
+    Un solo script en la carpeta de Inicio (shell:startup) cubre dos cosas: (1) el
+    reintento de arranque (a los 30s y 120s del login, sin condición — vale la pena
+    forzar el intento tan temprano) y (2) un bucle periódico cada 10 minutos el resto de
+    la sesión, que solo reconecta lo que esté caído (`if not exist`) — pedido explícito
+    del usuario, para cubrir una caída a mitad del día que el reintento de arranque no
+    alcanza a cubrir.
+
+    Deliberadamente NO usa el Programador de tareas para el bucle periódico (se intentó
+    primero, revertido 2026-08-19): aunque un `/sc minute` simple sí se logra crear sin
+    el problema de sintaxis de `/ri`+`onlogon`, Windows Defender marcó el patrón
+    `schtasks /create` + `.bat` en `AppData` + `cmd.exe` como `Trojan:Win32/Commando.A!ml`
+    (falso positivo por ML, no por firma) en pruebas reales — es indistinguible para esa
+    heurística de una técnica de persistencia real de malware, y se repetiría en cada PC
+    de oficina que reciba este script por primera vez. Un bucle dentro de un script de
+    Inicio no registra ninguna tarea nueva — mismo patrón (proceso vivo el resto de la
+    sesión) que ya usa el watchdog del Mac (`mount-nas.sh` + LaunchAgent), sin la firma
+    que dispara la alerta.
+    """
+    lineas = ["@echo off", "timeout /t 30 /nobreak >nul"]
+    for _ in range(2):
+        lineas += _lineas_reconexion(chequear=False)
+        lineas.append("timeout /t 90 /nobreak >nul")
+    lineas += [
+        ":bucle",
+        "timeout /t 600 /nobreak >nul",
+    ] + _lineas_reconexion(chequear=True) + [
+        "goto bucle",
+    ]
+
+    destino = os.path.join(_startup_folder(), "EnsambleReconectarNAS.bat")
+    try:
+        os.makedirs(_startup_folder(), exist_ok=True)
+        with open(destino, "w", encoding="utf-8") as f:
+            f.write("\r\n".join(lineas) + "\r\n")
+        ok("Reconexión automática configurada (arranque + verificación cada 10 min).")
+        return True
+    except Exception:
+        warn("No se pudo configurar la reconexión automática (no crítico).")
+        return False
+
+def _guardar_credenciales_win():
+    """Acción standalone: solo pide usuario/contraseña y los guarda en cmdkey — no toca
+    net use ni la conexión ya activa. Para cuando la unidad ya está montada pero sin
+    credencial guardada (ej. se mapeó manualmente desde el Explorador)."""
+    info("Vamos a guardar tu usuario y contraseña del NAS para que Windows no los vuelva a pedir.")
+    usuario = ask("Usuario NAS")
+    pwd = password_input("Contraseña NAS")
+    run(f'cmdkey /delete:{NAS_HOST_ALIAS}', check=False, capture=True)
+    run(f'cmdkey /add:{NAS_HOST_ALIAS} /user:"{usuario}" /pass:"{pwd}"', check=False, capture=True)
+    if _unidad_asignada(DRIVE_ARCHIVO):
+        run(f'cmdkey /delete:{NAS_LAN_IP}', check=False, capture=True)
+        run(f'cmdkey /add:{NAS_LAN_IP} /user:"{usuario}" /pass:"{pwd}"', check=False, capture=True)
+    ok("Credenciales guardadas.")
+
 def _montar_unidad_win(letra, share, usuario, password, host=NAS_HOST_ALIAS):
     unc = f"\\\\{host}\\{share}"
     run(f'net use {letra} /delete /y', check=False, capture=True)
@@ -637,6 +815,7 @@ def _montar_unidad_win(letra, share, usuario, password, host=NAS_HOST_ALIAS):
     result = run(cmd, check=False)
     if result.returncode == 0:
         ok(f"{letra} → {unc}")
+        _instalar_reconexion_startup_win()
         return True
     else:
         err(f"No se pudo montar {letra}.")
@@ -918,7 +1097,9 @@ def resumen_final(ubicacion, capas, resultado):
     if resultado.get("acciones"):
         nombres = {"configurar": "Se instaló/configuró lo que faltaba",
                    "reconectar_synodrive": "Se mostró la guía para reconectar Synology Drive",
-                   "conectar": "Se conectó la carpeta compartida"}
+                   "conectar": "Se conectó la carpeta compartida",
+                   "guardar_credenciales": "Se guardaron las credenciales del NAS",
+                   "crear_tarea_reconexion": "Se configuró la reconexión automática (arranque + cada 10 min)"}
         info("")
         info("Qué se hizo hoy:")
         for a in resultado["acciones"]:
