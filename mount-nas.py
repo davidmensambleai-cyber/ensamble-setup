@@ -317,6 +317,35 @@ def _smb_montado():
         except Exception:
             return False
 
+def _watchdog_mac_instalado():
+    """True si el watchdog de reconexión del Mac está instalado Y cargado."""
+    if OS != "Darwin":
+        return False
+    script = os.path.expanduser("~/.local/bin/nas-watchdog-mac.sh")
+    plist = os.path.expanduser(f"~/Library/LaunchAgents/{WATCHDOG_MAC_LABEL}.plist")
+    if not (os.path.exists(script) and os.path.exists(plist)):
+        return False
+    r = run(f"launchctl list {WATCHDOG_MAC_LABEL}", check=False, capture=True)
+    return r.returncode == 0
+
+
+def _keychain_tiene_nas():
+    """True si el llavero ya guarda una contraseña SMB para el NAS.
+
+    El watchdog monta SIN contraseña en el comando — la toma del llavero. Si no
+    está guardada, bajo launchd macOS abriría un diálogo que nadie puede
+    contestar y la reconexión falla en silencio. Por eso se diagnostica aparte.
+    """
+    if OS != "Darwin":
+        return False
+    for servidor in (NAS_LAN_IP, NAS_HOST_ALIAS):
+        r = run(f"security find-internet-password -s '{servidor}'",
+                check=False, capture=True)
+        if r.returncode == 0:
+            return True
+    return False
+
+
 def _synodrive_instalado():
     if OS == "Windows":
         paths = [
@@ -501,6 +530,33 @@ def diagnosticar(ubicacion):
                                    "para que no tengas que volver a poner la contraseña si la red va lenta o se cae un momento",
                                    "crear_tarea_reconexion"))
 
+        # ── Reconexión automática + llavero (Mac) ──────────────────
+        # Deliberadamente NO condicionado a `montada`: si el share ya está
+        # montado a mano, estas dos capas son justo las que faltan y las que
+        # nadie ve. Es el mismo criterio de las capas equivalentes de Windows
+        # (FIX-006), que en Mac nunca se habían replicado — un Mac con el NAS
+        # montado a mano salía "todo verde" y jamás ofrecía el watchdog
+        # (incidente ENS-MAC-DSK-01, 2026-09-04).
+        if OS == "Darwin":
+            if _watchdog_mac_instalado():
+                capas.append(_capa("Reconexión automática", VERDE,
+                                   "Configurada — se reconecta al iniciar sesión y cada minuto",
+                                   "para que el NAS vuelva solo al reiniciar, sin montarlo a mano"))
+            else:
+                capas.append(_capa("Reconexión automática", ROJO,
+                                   "Todavía no está configurada",
+                                   "para que el NAS vuelva solo al reiniciar, sin montarlo a mano",
+                                   "instalar_watchdog_mac"))
+
+            if _keychain_tiene_nas():
+                capas.append(_capa("Contraseña en el llavero", VERDE,
+                                   "Guardada — la reconexión automática puede usarla",
+                                   "porque la reconexión automática saca la contraseña del llavero: no te la puede preguntar"))
+            else:
+                capas.append(_capa("Contraseña en el llavero", AMBAR,
+                                   "No está guardada — conecta una vez desde Finder marcando \"Recordar esta contraseña\"",
+                                   "porque la reconexión automática saca la contraseña del llavero: no te la puede preguntar"))
+
         # ── Navegador dentro de la oficina ─────────────────────────
         if _hosts_tiene_alias():
             capas.append(_capa("Navegador dentro de la oficina", VERDE,
@@ -654,6 +710,14 @@ def enrutar(capas, ubicacion):
         if confirm("¿Configurar la reconexión automática al iniciar sesión?"):
             _instalar_reconexion_startup_win()
             resultado["acciones"].append("crear_tarea_reconexion")
+
+    # 6) Instalar la reconexión automática (Mac) — no requiere desmontar nada
+    if "instalar_watchdog_mac" in acciones:
+        info("")
+        if confirm("¿Configurar la reconexión automática del NAS?"):
+            usuario_wd = ask("Usuario NAS")
+            if _instalar_watchdog_mac(usuario_wd, [SHARE_ENSAMBLE]):
+                resultado["acciones"].append("instalar_watchdog_mac")
 
     return resultado
 
@@ -823,16 +887,43 @@ def _montar_unidad_win(letra, share, usuario, password, host=NAS_HOST_ALIAS):
         return False
 
 def _montar_smb_mac(share, punto_montaje, usuario, password):
-    os.makedirs(punto_montaje, exist_ok=True)
-    unc = f"smb://{usuario}:{password}@{NAS_HOST_ALIAS}/{share}"
-    result = run(f"mount_smbfs '{unc}' '{punto_montaje}'", check=False)
-    if result.returncode == 0:
+    """Monta un share SMB del NAS en Mac vía AppleScript (`mount volume`).
+
+    NO crear el mountpoint a mano: `/Volumes` es root:wheel, así que
+    `os.makedirs()` revienta con PermissionError [Errno 13] para un usuario
+    normal. Incidente real 2026-09-04 en ENS-MAC-DSK-01: el crash tumbaba el
+    script entero antes de llegar a `_instalar_watchdog_mac()`, 10 líneas más
+    abajo, y el equipo quedaba sin reconexión automática de forma permanente.
+    `mount volume` delega en NetAuthAgent, que crea el punto de montaje con
+    privilegios — exactamente lo que hace Finder.
+
+    El AppleScript viaja por stdin, nunca por argv: así la contraseña no queda
+    visible en `ps` para los demás usuarios del equipo (Bloque L).
+    """
+    def esc(s):
+        return str(s).replace("\\", "\\\\").replace('"', '\\"')
+
+    script = (
+        f'mount volume "smb://{NAS_LAN_IP}/{esc(share)}" '
+        f'as user name "{esc(usuario)}" with password "{esc(password)}"'
+    )
+    try:
+        result = subprocess.run(["osascript", "-"], input=script, text=True,
+                                capture_output=True, timeout=90)
+    except Exception as e:
+        err(f"No se pudo montar {share}: {e}")
+        return False
+
+    if result.returncode == 0 and os.path.ismount(punto_montaje):
         ok(f"Montado en {punto_montaje}")
         return True
-    else:
-        err(f"No se pudo montar {share}.")
-        info("Verifica credenciales y conexión de red.")
-        return False
+
+    err(f"No se pudo montar {share}.")
+    detalle = (result.stderr or "").strip()
+    if detalle:
+        info(detalle.splitlines()[0][:160])
+    info("Verifica credenciales y conexión de red.")
+    return False
 
 
 # ─────────────────────────────────────────────
@@ -851,32 +942,48 @@ def _montar_smb_mac(share, punto_montaje, usuario, password):
 WATCHDOG_MAC_LABEL = "com.ensamble.nas-watchdog"
 
 WATCHDOG_MAC_SH = r'''#!/bin/bash
-# nas-watchdog-mac.sh — Watchdog del montaje SMB del NAS Ensamble para Mac EN LA LAN DE OFICINA.
+# nas-watchdog-mac.sh — Mantiene montado el share SMB del NAS en un Mac DE OFICINA (LAN).
 # Generado por mount-nas.py (módulo "red de la oficina"). NO editar a mano aquí:
 # editar la constante WATCHDOG_MAC_SH en mount-nas.py y volver a conectar.
+# Copia de referencia legible: 04_Infraestructura/superscript/nas-watchdog-mac.sh
+#
+# Corre al iniciar sesión y cada 60s (LaunchAgent com.ensamble.nas-watchdog).
+#
+# -- REGLA DE ORO: este script NUNCA desmonta nada ---------------------------
+#   Share NO montado (y NAS en LAN) -> lo monta.
+#   Share montado                   -> no hace absolutamente nada.
+#   NAS fuera de la LAN             -> no hace nada (afuera se usa Synology Drive).
+#   NAS en ventana de apagado       -> silencio total.
+#
+# -- Por que (FIX-009, 2026-09-04) ------------------------------------------
+# La version anterior probaba "liveness" leyendo un archivo del share (canary)
+# y desmontaba tras N fallos consecutivos. Bajo launchd esa lectura SIEMPRE
+# falla: un proceso lanzado por launchd no tiene consentimiento de privacidad
+# (TCC) para leer volumenes de red, y no puede pedirlo (no hay quien acepte el
+# dialogo). El resultado era un falso "muerto" -> desmontar -> remontar ->
+# falso "muerto", cada pocos minutos, desconectando el NAS solo.
+#
+# `mount` es una llamada al sistema y NO pasa por TCC: detectar "no montado" si
+# es fiable desde launchd. Detectar "montado pero zombie" no lo es, asi que ese
+# caso simplemente no se maneja aqui. Leccion: una automatizacion de
+# recuperacion nunca debe tener una accion destructiva disparada por una
+# condicion que no puede verificar de forma fiable en su propio contexto.
+#
+# NO tiene fallback Tailscale: montar el NAS por SMB fuera de la LAN es una
+# excepcion reservada a un unico equipo (whitelist en smb-restrict.sh del NAS).
+# El watchdog personal de ese equipo es otro archivo, en 04_Infraestructura/NAS/mac/.
 
 set -u
 
 LAN_IP="__LAN_IP__"
 NAS_USER="__NAS_USER__"
+HOST_ALIAS="__HOST_ALIAS__"
 SHARES=(__SHARES__)
 
-STATE_DIR="/tmp"
 LOG="/tmp/nas-wd-lan.log"
 LOCK_DIR="/tmp/nas-wd-lan.lock.d"
-
-FAILS_BEFORE_REPAIR=5
-COOLDOWN_SECONDS=600
-PROBE_TIMEOUT=30
 LOG_MAX_BYTES=1048576
 MOUNT=/sbin/mount
-
-canary_for() {
-    case "$1" in
-        "Ensamble") echo "/Volumes/Ensamble/DTI_Tecnología, innovación y optimización/ensamble-platform/CLAUDE.md" ;;
-        *) echo "" ;;
-    esac
-}
 
 log() { echo "$(date '+%F %T'): $1" >> "$LOG"; }
 
@@ -889,6 +996,7 @@ rotar_logs() {
     done
 }
 
+# Lock: una sola instancia (mkdir atomico, sin dependencias).
 adquirir_lock() {
     if mkdir "$LOCK_DIR" 2>/dev/null; then echo $$ > "$LOCK_DIR/pid"; trap 'rm -rf "$LOCK_DIR"' EXIT; return 0; fi
     local oldpid; oldpid=$(cat "$LOCK_DIR/pid" 2>/dev/null || echo "")
@@ -898,6 +1006,9 @@ adquirir_lock() {
     return 1
 }
 
+# Ventana de apagado programado del NAS (Power Schedule DSM):
+#   Lunes a viernes: apagado 01:00, encendido 04:00
+#   Sabado y domingo: apagado 23:00, encendido 04:00 del dia siguiente
 en_ventana_apagado() {
     local dow hour
     dow=$(date '+%u'); hour=$(date '+%H'); hour=$((10#$hour))
@@ -909,78 +1020,36 @@ en_ventana_apagado() {
 
 en_lan() { ping -c 1 -t 1 "$LAN_IP" &>/dev/null; }
 
+# Unico chequeo del script. `mount` es syscall: fiable desde launchd, sin TCC.
 montado() { "$MOUNT" | grep -q " on /Volumes/$1 ("; }
 
-probe_vivo() {
-    local share="$1" canary
-    montado "$share" || return 1
-    canary=$(canary_for "$share")
-    if [ -n "$canary" ]; then
-        perl -e "alarm $PROBE_TIMEOUT; exec @ARGV" /bin/cat "$canary" >/dev/null 2>&1
-        return $?
-    fi
-    perl -e "alarm $PROBE_TIMEOUT; exec @ARGV" /bin/ls "/Volumes/$share" >/dev/null 2>&1
-}
-
+# Sin contrasena en el comando: la toma del llavero del usuario. Se prueba la IP y
+# luego el alias de /etc/hosts porque el llavero puede tener guardada la
+# credencial bajo cualquiera de los dos (segun como se haya conectado la primera
+# vez). Si no esta en ninguno, macOS abriria un dialogo que nadie puede contestar
+# bajo launchd — por eso mount-nas.py revisa el llavero en su diagnostico y avisa.
+# Nunca desmonta: si un intento no monta, simplemente se reintenta al proximo ciclo.
 montar() {
-    local share="$1"
-    osascript -e "mount volume \"smb://$NAS_USER@$LAN_IP/$share\"" >> "$LOG" 2>&1
-    sleep 3
-    if probe_vivo "$share"; then log "$share: montado y vivo"; else log "$share: intento no quedó vivo (reintenta al próximo ciclo)"; fi
+    local share="$1" destino
+    for destino in "$LAN_IP" "$HOST_ALIAS"; do
+        [ -n "$destino" ] || continue
+        osascript -e "mount volume \"smb://$NAS_USER@$destino/$share\"" >> "$LOG" 2>&1
+        sleep 3
+        if montado "$share"; then log "$share: montado via $destino"; return 0; fi
+    done
+    log "$share: no se pudo montar (reintenta al proximo ciclo)"
 }
 
-reparar() {
-    local share="$1" mnt="/Volumes/$1"
-    log "$share: montaje muerto confirmado ($FAILS_BEFORE_REPAIR fallos seguidos) -> desmontando limpio"
-    /sbin/umount "$mnt" 2>/dev/null \
-        || /usr/sbin/diskutil unmount "$mnt" 2>/dev/null \
-        || /usr/sbin/diskutil unmount force "$mnt" 2>/dev/null
-    sleep 1
-    if montado "$share"; then
-        log "$share: no se pudo desmontar (ocupado) -> se deja como está, reintenta tras cooldown"
-        return 1
-    fi
-    montar "$share"
-    date +%s > "$STATE_DIR/nas-wd-lan.last-repair.$(echo "$share" | tr ' ' '_')"
-}
-
-en_cooldown() {
-    local last now
-    last=$(cat "$STATE_DIR/nas-wd-lan.last-repair.$(echo "$1" | tr ' ' '_')" 2>/dev/null || echo 0)
-    now=$(date +%s)
-    [ $((now - last)) -lt "$COOLDOWN_SECONDS" ]
-}
-
+# ----------------------------- flujo ------------------------------
 rotar_logs
 en_ventana_apagado && exit 0
 en_lan || exit 0
 adquirir_lock || exit 0
 
 for share in "${SHARES[@]}"; do
-    key=$(echo "$share" | tr ' ' '_')
-    state="$STATE_DIR/nas-wd-lan.fails.$key"
-    if ! montado "$share"; then
-        log "$share: no montado -> montando"
-        montar "$share"
-        echo 0 > "$state"
-        continue
-    fi
-    if probe_vivo "$share"; then
-        echo 0 > "$state"
-        continue
-    fi
-    fails=$(cat "$state" 2>/dev/null || echo 0)
-    fails=$((fails + 1))
-    echo "$fails" > "$state"
-    log "$share: probe de liveness falló (consecutivos: $fails/$FAILS_BEFORE_REPAIR)"
-    if [ "$fails" -ge "$FAILS_BEFORE_REPAIR" ]; then
-        if en_cooldown "$share"; then
-            log "$share: en cooldown de reparación -> espera"
-        else
-            reparar "$share"
-            echo 0 > "$state"
-        fi
-    fi
+    montado "$share" && continue      # ya esta montado -> NO TOCAR
+    log "$share: no montado -> montando"
+    montar "$share"
 done
 exit 0
 '''
@@ -1001,6 +1070,7 @@ def _instalar_watchdog_mac(usuario, shares):
     contenido = (WATCHDOG_MAC_SH
                  .replace("__LAN_IP__", NAS_LAN_IP)
                  .replace("__NAS_USER__", usuario)
+                 .replace("__HOST_ALIAS__", NAS_HOST_ALIAS)
                  .replace("__SHARES__", shares_bash))
     try:
         with open(script_path, "w") as f:
@@ -1021,6 +1091,7 @@ def _instalar_watchdog_mac(usuario, shares):
         f'    <array><string>/bin/bash</string><string>{script_path}</string></array>\n'
         '    <key>RunAtLoad</key><true/>\n'
         '    <key>StartInterval</key><integer>60</integer>\n'
+        '    <key>LimitLoadToSessionType</key><string>Aqua</string>\n'
         '    <key>StandardOutPath</key><string>/tmp/nas-wd-lan.out</string>\n'
         '    <key>StandardErrorPath</key><string>/tmp/nas-wd-lan.err</string>\n'
         '</dict>\n</plist>\n'
