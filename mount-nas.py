@@ -716,7 +716,7 @@ def enrutar(capas, ubicacion):
         info("")
         if confirm("¿Configurar la reconexión automática del NAS?"):
             usuario_wd = ask("Usuario NAS")
-            if _instalar_watchdog_mac(usuario_wd, [SHARE_ENSAMBLE]):
+            if _instalar_watchdog_mac(usuario_wd, _shares_montados()):
                 resultado["acciones"].append("instalar_watchdog_mac")
 
     return resultado
@@ -940,50 +940,204 @@ def _montar_smb_mac(share, punto_montaje, usuario, password):
 # (mantener en sincronía con esta constante).
 
 WATCHDOG_MAC_LABEL = "com.ensamble.nas-watchdog"
+OPEN_PROJECT_MAC_LABEL = "com.ensamble.open-project"
+SLEEPWATCHER_LABEL = "com.ensamble.sleepwatcher"
+
+OPEN_PROJECT_SH = r'''#!/bin/bash
+# open-project.sh — abre VS Code en la carpeta del proyecto Ensamble una vez que
+# el NAS esta montado. Generado por mount-nas.py; no editar a mano aqui.
+#
+# Existe porque VS Code, si arranca antes de que /Volumes/Ensamble este montado
+# (tipico tras un reinicio: red aun levantando), no puede restaurar la carpeta
+# del proyecto y abre una ventana vacia.
+#
+# Se espera por `mount` (syscall, sin TCC) y NO por lectura de archivo: un
+# proceso de launchd no tiene consentimiento de privacidad para leer volumenes
+# de red y no puede pedirlo (FIX-009). Se lanza VS Code con `open -a`
+# (LaunchServices) — VS Code si tiene consentimiento y lee la carpeta sin
+# problema una vez abierto.
+
+PROJECT="/Volumes/Ensamble/DTI_Tecnología, innovación y optimización/ensamble-platform"
+MOUNTPOINT="/Volumes/Ensamble"
+LOG="/tmp/open-project.log"
+
+log() { echo "$(date '+%F %T'): $1" >> "$LOG"; }
+
+if [ -f "$LOG" ] && [ "$(stat -f%z "$LOG" 2>/dev/null || echo 0)" -gt 262144 ]; then
+    tail -c 40000 "$LOG" > "$LOG.tmp" && mv "$LOG.tmp" "$LOG"
+fi
+
+# Espera hasta 120s (40 x 3s) a que el share este montado.
+for i in $(seq 1 40); do
+    if /sbin/mount | grep -q " on ${MOUNTPOINT} ("; then
+        log "NAS montado tras ~$((i*3))s -> abriendo VS Code"
+        open -a "Visual Studio Code" "$PROJECT" >>"$LOG" 2>&1
+        exit 0
+    fi
+    sleep 3
+done
+
+log "timeout: NAS no montado tras 120s -> no se abre VS Code"
+exit 0
+'''
+
+SLEEP_UNMOUNT_SH = r'''#!/bin/bash
+# ~/.sleep — lo ejecuta sleepwatcher JUSTO ANTES de que el Mac se duerma.
+# Generado por mount-nas.py; no editar a mano aqui.
+#
+# Desmonta limpio los shares SMB del NAS. Dormir con SMB montado deja un
+# mountpoint zombie: aparece montado para `mount` pero cuelga en cualquier
+# lectura real. El watchdog no puede distinguirlo de uno sano (no puede leer
+# bajo launchd por TCC) y por la REGLA DE ORO no lo desmonta, asi que el zombie
+# sobrevive hasta que alguien lo desmonta a mano. Prevenirlo aqui es la unica
+# defensa. ~/.wakeup vuelve a montar al despertar.
+#
+# Deja un MARCADOR para ~/.displaywake: si hubo desmontaje, VS Code se quedo con
+# la carpeta del proyecto bajo los pies y hay que revalidarla cuando el usuario
+# vuelva. Sin el marcador no se toca VS Code (no robar foco en cada despertar).
+
+LOG="/tmp/nas-sleepwake.log"
+MARCADOR="/tmp/nas-remontaje-pendiente"
+log() { echo "$(date '+%F %T') [sleep] $1" >> "$LOG"; }
+
+if [ -f "$LOG" ] && [ "$(stat -f%z "$LOG" 2>/dev/null || echo 0)" -gt 262144 ]; then
+    tail -c 40000 "$LOG" > "$LOG.tmp" && mv "$LOG.tmp" "$LOG"
+fi
+
+desmontados=0
+for share in __SHARES__; do
+    mnt="/Volumes/$share"
+    /sbin/mount | grep -q " on $mnt (" || continue
+    if /sbin/umount "$mnt" 2>/dev/null || /usr/sbin/diskutil unmount force "$mnt" 2>/dev/null; then
+        log "desmontado: $share"
+        desmontados=$((desmontados + 1))
+    else
+        log "NO se pudo desmontar: $share (se dormira con el montaje vivo)"
+    fi
+done
+
+[ "$desmontados" -gt 0 ] && touch "$MARCADOR"
+log "durmiendo (shares desmontados: $desmontados)"
+exit 0
+'''
+
+WAKEUP_REMOUNT_SH = r'''#!/bin/bash
+# ~/.wakeup — lo ejecuta sleepwatcher al DESPERTAR el Mac (incluye dark wakes).
+# Generado por mount-nas.py; no editar a mano aqui.
+#
+# Solo remonta. NO toca VS Code: en un dark wake la pantalla sigue apagada y el
+# usuario no esta, asi que abrir una app ahi es robar foco a nadie. De eso se
+# encarga ~/.displaywake, que sleepwatcher dispara con -W (cuando la pantalla
+# despierta de verdad).
+#
+# El watchdog ya espera a que el NAS acepte TCP/445 antes de montar, asi que
+# aqui no hace falta adivinar cuanto tarda la red en volver.
+
+LOG="/tmp/nas-sleepwake.log"
+log() { echo "$(date '+%F %T') [wake] $1" >> "$LOG"; }
+
+log "despertando -> lanzando watchdog"
+/bin/bash "$HOME/.local/bin/nas-watchdog-mac.sh"
+
+montados=$(/sbin/mount | grep -c "on /Volumes/.* (smbfs")
+log "watchdog terminado (shares montados ahora: $montados)"
+exit 0
+'''
+
+DISPLAYWAKE_SH = r'''#!/bin/bash
+# ~/.displaywake — lo ejecuta sleepwatcher (-W) cuando la PANTALLA despierta.
+# Generado por mount-nas.py; no editar a mano aqui.
+#
+# Resuelve el hueco que dejaba el diseno anterior: al dormir, ~/.sleep desmonta
+# el share mientras VS Code tiene la carpeta del proyecto abierta. Al despertar
+# se remonta bien, pero VS Code se quedo apuntando a una ruta que desaparecio y
+# volvio — file watchers rotos, archivos que no cargan. El watchdog no arregla
+# eso porque no es un problema de montaje.
+#
+# Se dispara con -W y no con -w a proposito: -w salta tambien en dark wakes
+# (decenas al dia, pantalla apagada, usuario ausente) y abrir una app ahi no
+# sirve de nada. -W solo salta cuando la pantalla se enciende de verdad.
+#
+# Y solo actua si ~/.sleep dejo el MARCADOR, es decir si de verdad hubo un
+# desmontaje que revalidar. Sin marcador no se toca VS Code: despertar la
+# pantalla no deberia reordenar las ventanas de nadie.
+
+PROJECT="/Volumes/Ensamble/DTI_Tecnología, innovación y optimización/ensamble-platform"
+MOUNTPOINT="/Volumes/Ensamble"
+MARCADOR="/tmp/nas-remontaje-pendiente"
+LOG="/tmp/nas-sleepwake.log"
+log() { echo "$(date '+%F %T') [display] $1" >> "$LOG"; }
+
+[ -f "$MARCADOR" ] || exit 0
+
+# Espera hasta 60s (20 x 3s) a que el watchdog termine de remontar.
+for i in $(seq 1 20); do
+    /sbin/mount | grep -q " on ${MOUNTPOINT} (" && break
+    sleep 3
+done
+
+if ! /sbin/mount | grep -q " on ${MOUNTPOINT} ("; then
+    log "el NAS no volvio a montarse en 60s -> no se toca VS Code (marcador se conserva)"
+    exit 0
+fi
+
+# `open -a` es idempotente: si VS Code ya tiene la carpeta abierta la enfoca y
+# revalida; si quedo con la ruta rota, la reabre; si estaba cerrado, la abre.
+open -a "Visual Studio Code" "$PROJECT" >>"$LOG" 2>&1
+log "NAS remontado -> VS Code revalidado en el proyecto"
+rm -f "$MARCADOR"
+exit 0
+'''
 
 WATCHDOG_MAC_SH = r'''#!/bin/bash
-# nas-watchdog-mac.sh — Mantiene montado el share SMB del NAS en un Mac DE OFICINA (LAN).
-# Generado por mount-nas.py (módulo "red de la oficina"). NO editar a mano aquí:
+# nas-watchdog-mac.sh — Mantiene montados los shares SMB del NAS en un Mac DE OFICINA (LAN).
+# Generado por mount-nas.py (modulo "red de la oficina"). NO editar a mano aqui:
 # editar la constante WATCHDOG_MAC_SH en mount-nas.py y volver a conectar.
 # Copia de referencia legible: 04_Infraestructura/superscript/nas-watchdog-mac.sh
 #
-# Corre al iniciar sesión y cada 60s (LaunchAgent com.ensamble.nas-watchdog).
+# Corre al iniciar sesion y cada 60s (LaunchAgent com.ensamble.nas-watchdog).
 #
 # -- REGLA DE ORO: este script NUNCA desmonta nada ---------------------------
-#   Share NO montado (y NAS en LAN) -> lo monta.
-#   Share montado                   -> no hace absolutamente nada.
-#   NAS fuera de la LAN             -> no hace nada (afuera se usa Synology Drive).
-#   NAS en ventana de apagado       -> silencio total.
+#   Share NO montado (y NAS alcanzable) -> lo monta.
+#   Share montado                       -> no hace absolutamente nada.
+#   NAS en ventana de apagado           -> silencio total.
 #
-# -- Por que (FIX-009, 2026-09-04) ------------------------------------------
-# La version anterior probaba "liveness" leyendo un archivo del share (canary)
-# y desmontaba tras N fallos consecutivos. Bajo launchd esa lectura SIEMPRE
-# falla: un proceso lanzado por launchd no tiene consentimiento de privacidad
-# (TCC) para leer volumenes de red, y no puede pedirlo (no hay quien acepte el
-# dialogo). El resultado era un falso "muerto" -> desmontar -> remontar ->
-# falso "muerto", cada pocos minutos, desconectando el NAS solo.
+# -- Por que no desmonta (FIX-009, 2026-09-04) ------------------------------
+# Un proceso lanzado por launchd no tiene consentimiento de privacidad (TCC)
+# para leer volumenes de red, y no puede pedirlo. La version anterior probaba
+# "liveness" leyendo un archivo del share y desmontaba tras N fallos: bajo
+# launchd esa lectura falla SIEMPRE -> desmontaba en bucle. `mount` es una
+# llamada al sistema y NO pasa por TCC: detectar "no montado" si es fiable.
+# Detectar "montado pero zombie" no lo es, asi que ese caso no se maneja aqui
+# (lo previene el desmontaje limpio antes de dormir, ~/.sleep).
 #
-# `mount` es una llamada al sistema y NO pasa por TCC: detectar "no montado" si
-# es fiable desde launchd. Detectar "montado pero zombie" no lo es, asi que ese
-# caso simplemente no se maneja aqui. Leccion: una automatizacion de
-# recuperacion nunca debe tener una accion destructiva disparada por una
-# condicion que no puede verificar de forma fiable en su propio contexto.
+# -- Timeout y espera de red (heredado del Mac de David, 2026-09-07) --------
+# Un `osascript mount volume` contra una red que no responde se cuelga con
+# error AppleScript -5014 y retiene el lock, bloqueando todos los reintentos
+# del ciclo de 60s (caso real: 1 hora colgado). Dos defensas:
+#   A1) timeout duro alrededor del osascript (MOUNT_TIMEOUT).
+#   A2) sondeo TCP a 445 antes de llamar a AppleScript (nas_alcanzable).
 #
-# NO tiene fallback Tailscale: montar el NAS por SMB fuera de la LAN es una
+# Sin fallback Tailscale: montar el NAS por SMB fuera de la LAN es una
 # excepcion reservada a un unico equipo (whitelist en smb-restrict.sh del NAS).
-# El watchdog personal de ese equipo es otro archivo, en 04_Infraestructura/NAS/mac/.
 
 set -u
 
-LAN_IP="__LAN_IP__"
+# -- Config (los marcadores los resuelve mount-nas.py al instalar) ----------
+HOST_ALIAS="__HOST_ALIAS__"    # preferido: entrada de /etc/hosts (nas_local)
+LAN_IP="__LAN_IP__"            # respaldo por IP directa
 NAS_USER="__NAS_USER__"
-HOST_ALIAS="__HOST_ALIAS__"
 SHARES=(__SHARES__)
 
 LOG="/tmp/nas-wd-lan.log"
 LOCK_DIR="/tmp/nas-wd-lan.lock.d"
 LOG_MAX_BYTES=1048576
 MOUNT=/sbin/mount
+
+MOUNT_TIMEOUT=45               # A1 - segundos maximos por intento de montaje
+RED_INTENTOS=6                 # A2 - rondas de espera a que el NAS responda
+RED_PAUSA=4                    # A2 - segundos entre rondas
+NC_TIMEOUT=2                   # A2 - timeout de cada sondeo TCP
 
 log() { echo "$(date '+%F %T'): $1" >> "$LOG"; }
 
@@ -996,7 +1150,6 @@ rotar_logs() {
     done
 }
 
-# Lock: una sola instancia (mkdir atomico, sin dependencias).
 adquirir_lock() {
     if mkdir "$LOCK_DIR" 2>/dev/null; then echo $$ > "$LOCK_DIR/pid"; trap 'rm -rf "$LOCK_DIR"' EXIT; return 0; fi
     local oldpid; oldpid=$(cat "$LOCK_DIR/pid" 2>/dev/null || echo "")
@@ -1018,94 +1171,238 @@ en_ventana_apagado() {
     return 1
 }
 
-en_lan() { ping -c 1 -t 1 "$LAN_IP" &>/dev/null; }
-
-# Unico chequeo del script. `mount` es syscall: fiable desde launchd, sin TCC.
+# Unico chequeo de estado. `mount` es syscall: fiable desde launchd, sin TCC.
 montado() { "$MOUNT" | grep -q " on /Volumes/$1 ("; }
 
-# Sin contrasena en el comando: la toma del llavero del usuario. Se prueba la IP y
-# luego el alias de /etc/hosts porque el llavero puede tener guardada la
-# credencial bajo cualquiera de los dos (segun como se haya conectado la primera
-# vez). Si no esta en ninguno, macOS abriria un dialogo que nadie puede contestar
-# bajo launchd — por eso mount-nas.py revisa el llavero en su diagnostico y avisa.
-# Nunca desmonta: si un intento no monta, simplemente se reintenta al proximo ciclo.
-montar() {
-    local share="$1" destino
-    for destino in "$LAN_IP" "$HOST_ALIAS"; do
-        [ -n "$destino" ] || continue
-        osascript -e "mount volume \"smb://$NAS_USER@$destino/$share\"" >> "$LOG" 2>&1
-        sleep 3
-        if montado "$share"; then log "$share: montado via $destino"; return 0; fi
+# A2 - espera a que el NAS acepte SMB. Devuelve por stdout el destino alcanzable.
+# El ALIAS va primero a proposito: la credencial del llavero queda atada al
+# nombre de servidor con que se guardo, y el equipo se conecta por `nas_local`
+# (protocolo-conexion-nas.md manda hostname local en la LAN). Montar por IP
+# cuando el llavero solo tiene el alias dispara un dialogo de contrasena que
+# nadie puede contestar bajo launchd.
+nas_alcanzable() {
+    local intento destino
+    for intento in $(seq 1 "$RED_INTENTOS"); do
+        for destino in "$HOST_ALIAS" "$LAN_IP"; do
+            [ -n "$destino" ] || continue
+            if nc -z -G "$NC_TIMEOUT" "$destino" 445 >/dev/null 2>&1; then
+                echo "$destino"; return 0
+            fi
+        done
+        sleep "$RED_PAUSA"
     done
-    log "$share: no se pudo montar (reintenta al proximo ciclo)"
+    return 1
+}
+
+# A1 - montaje con timeout duro. Sin la alarma, un osascript colgado retiene el
+# lock indefinidamente y bloquea todos los reintentos.
+montar() {
+    local share="$1" destino="$2"
+    perl -e "alarm $MOUNT_TIMEOUT; exec @ARGV" \
+        /usr/bin/osascript -e "mount volume \"smb://$NAS_USER@$destino/$share\"" >> "$LOG" 2>&1
+    sleep 2
+    if montado "$share"; then
+        log "$share: montado via $destino"
+    else
+        log "$share: no se pudo montar via $destino (error o timeout ${MOUNT_TIMEOUT}s; reintenta al proximo ciclo)"
+    fi
 }
 
 # ----------------------------- flujo ------------------------------
 rotar_logs
 en_ventana_apagado && exit 0
-en_lan || exit 0
 adquirir_lock || exit 0
+
+# Si no falta montar nada, salir sin tocar la red.
+pendiente=0
+for share in "${SHARES[@]}"; do montado "$share" || pendiente=1; done
+[ "$pendiente" -eq 0 ] && exit 0
+
+DESTINO=$(nas_alcanzable) || {
+    log "NAS no responde en 445 tras ~$((RED_INTENTOS * (RED_PAUSA + NC_TIMEOUT * 2)))s -> no se intenta montar (reintenta al proximo ciclo)"
+    exit 0
+}
 
 for share in "${SHARES[@]}"; do
     montado "$share" && continue      # ya esta montado -> NO TOCAR
-    log "$share: no montado -> montando"
-    montar "$share"
+    log "$share: no montado -> montando via $DESTINO"
+    montar "$share" "$DESTINO"
 done
 exit 0
 '''
 
 
+def _shares_montados():
+    """Shares del NAS montados ahora mismo (por `mount`, sin TCC)."""
+    if OS != "Darwin":
+        return []
+    r = run("/sbin/mount", check=False, capture=True)
+    salida = r.stdout or ""
+    return [s for s in (SHARE_ENSAMBLE, SHARE_ARCHIVO) if f" on /Volumes/{s} (" in salida]
+
+
+def _escribir_ejecutable(ruta, contenido):
+    try:
+        with open(ruta, "w") as f:
+            f.write(contenido)
+        os.chmod(ruta, 0o755)
+        return True
+    except Exception:
+        return False
+
+
+def _plist_launchagent(label, script_path, run_at_load=True, interval=None,
+                       out_log=None, err_log=None):
+    """Genera un LaunchAgent. `LimitLoadToSessionType: Aqua` es obligatorio:
+    `osascript mount volume` y `open -a` necesitan sesión gráfica."""
+    partes = [
+        '<?xml version="1.0" encoding="UTF-8"?>\n',
+        '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" '
+        '"http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n',
+        '<plist version="1.0">\n<dict>\n',
+        f'    <key>Label</key><string>{label}</string>\n',
+        '    <key>ProgramArguments</key>\n',
+        f'    <array><string>/bin/bash</string><string>{script_path}</string></array>\n',
+    ]
+    if run_at_load:
+        partes.append('    <key>RunAtLoad</key><true/>\n')
+    if interval:
+        partes.append(f'    <key>StartInterval</key><integer>{interval}</integer>\n')
+    partes.append('    <key>LimitLoadToSessionType</key><string>Aqua</string>\n')
+    if out_log:
+        partes.append(f'    <key>StandardOutPath</key><string>{out_log}</string>\n')
+    if err_log:
+        partes.append(f'    <key>StandardErrorPath</key><string>{err_log}</string>\n')
+    partes.append('</dict>\n</plist>\n')
+    return "".join(partes)
+
+
+def _cargar_launchagent(plist_path):
+    run(f"launchctl unload '{plist_path}'", check=False, capture=True)
+    r = run(f"launchctl load '{plist_path}'", check=False, capture=True)
+    return r.returncode == 0
+
+
 def _instalar_watchdog_mac(usuario, shares):
-    """Instala (o re-escribe) el watchdog SMB del Mac para la LAN de oficina.
-    `shares`: lista de shares que se montaron con éxito. Sin shares -> no hace nada."""
+    """Instala la reconexión automática del NAS en un Mac de oficina.
+
+    Tres piezas, todas idempotentes (se pueden reinstalar sin romper nada):
+
+    1. **Watchdog** (`nas-watchdog-mac.sh` + LaunchAgent, al login y cada 60s):
+       monta lo que falte, nunca desmonta.
+    2. **open-project** (`open-project.sh` + LaunchAgent, al login): abre VS Code
+       en el proyecto una vez que el NAS está montado.
+    3. **Hooks de sleep/wake** (`~/.sleep` / `~/.wakeup`): desmontan limpio antes
+       de dormir y remontan al despertar. **Requieren `sleepwatcher`** (Homebrew).
+       Si no está instalado se omiten y se avisa — el resto funciona igual, solo
+       que un mountpoint zombie tras una suspensión sobrevive hasta desmontarlo
+       a mano (ver REGLA DE ORO en el watchdog).
+
+    `shares`: lista de shares realmente montados. Sin shares -> no hace nada.
+    """
     if OS != "Darwin" or not shares:
         return False
+
     bin_dir = os.path.expanduser("~/.local/bin")
     la_dir = os.path.expanduser("~/Library/LaunchAgents")
     os.makedirs(bin_dir, exist_ok=True)
     os.makedirs(la_dir, exist_ok=True)
 
-    script_path = os.path.join(bin_dir, "nas-watchdog-mac.sh")
     shares_bash = " ".join(f'"{s}"' for s in shares)
-    contenido = (WATCHDOG_MAC_SH
-                 .replace("__LAN_IP__", NAS_LAN_IP)
-                 .replace("__NAS_USER__", usuario)
-                 .replace("__HOST_ALIAS__", NAS_HOST_ALIAS)
-                 .replace("__SHARES__", shares_bash))
-    try:
-        with open(script_path, "w") as f:
-            f.write(contenido)
-        os.chmod(script_path, 0o755)
-    except Exception:
+
+    # ── 1. Watchdog ───────────────────────────────────────────────
+    wd_path = os.path.join(bin_dir, "nas-watchdog-mac.sh")
+    wd = (WATCHDOG_MAC_SH
+          .replace("__HOST_ALIAS__", NAS_HOST_ALIAS)
+          .replace("__LAN_IP__", NAS_LAN_IP)
+          .replace("__NAS_USER__", usuario)
+          .replace("__SHARES__", shares_bash))
+    if not _escribir_ejecutable(wd_path, wd):
         warn("No se pudo escribir el watchdog del Mac (no crítico).")
         return False
 
-    plist_path = os.path.join(la_dir, f"{WATCHDOG_MAC_LABEL}.plist")
+    wd_plist = os.path.join(la_dir, f"{WATCHDOG_MAC_LABEL}.plist")
+    if not _escribir_ejecutable(wd_plist, _plist_launchagent(
+            WATCHDOG_MAC_LABEL, wd_path, run_at_load=True, interval=60,
+            out_log="/tmp/nas-wd-lan.out", err_log="/tmp/nas-wd-lan.err")):
+        warn("No se pudo escribir el LaunchAgent del watchdog (no crítico).")
+        return False
+    _cargar_launchagent(wd_plist)
+    ok("Reconexión automática configurada (al iniciar sesión y cada 60s).")
+
+    # ── 2. open-project ───────────────────────────────────────────
+    op_path = os.path.join(bin_dir, "open-project.sh")
+    if _escribir_ejecutable(op_path, OPEN_PROJECT_SH):
+        op_plist = os.path.join(la_dir, f"{OPEN_PROJECT_MAC_LABEL}.plist")
+        if _escribir_ejecutable(op_plist, _plist_launchagent(
+                OPEN_PROJECT_MAC_LABEL, op_path, run_at_load=True, interval=None,
+                out_log="/tmp/open-project.out", err_log="/tmp/open-project.err")):
+            _cargar_launchagent(op_plist)
+            ok("VS Code se abrirá en el proyecto al iniciar sesión.")
+
+    # ── 3. Hooks de sleep/wake (requieren sleepwatcher) ───────────
+    sleep_path = os.path.expanduser("~/.sleep")
+    wake_path = os.path.expanduser("~/.wakeup")
+    display_path = os.path.expanduser("~/.displaywake")
+    _escribir_ejecutable(sleep_path, SLEEP_UNMOUNT_SH.replace("__SHARES__", shares_bash))
+    _escribir_ejecutable(wake_path, WAKEUP_REMOUNT_SH)
+    _escribir_ejecutable(display_path, DISPLAYWAKE_SH)
+
+    if _sleepwatcher_instalado():
+        _cargar_sleepwatcher()
+        ok("Desmontaje limpio antes de dormir y remontaje al despertar activados.")
+    else:
+        warn("Falta `sleepwatcher` — los hooks de suspensión quedaron escritos pero inactivos.")
+        info("Para activarlos: brew install sleepwatcher, y vuelve a correr esto.")
+
+    return True
+
+
+def _sleepwatcher_bin():
+    for p in ("/opt/homebrew/sbin/sleepwatcher", "/usr/local/sbin/sleepwatcher"):
+        if os.path.exists(p):
+            return p
+    return None
+
+
+def _sleepwatcher_instalado():
+    return _sleepwatcher_bin() is not None
+
+
+def _cargar_sleepwatcher():
+    """LaunchAgent propio para sleepwatcher, apuntando a ~/.sleep y ~/.wakeup.
+    No se reutiliza el plist de la fórmula de Homebrew: cambia de ruta según el
+    prefijo (Intel vs Apple Silicon) y no siempre queda instalado en el usuario."""
+    binario = _sleepwatcher_bin()
+    if not binario:
+        return False
+    la_dir = os.path.expanduser("~/Library/LaunchAgents")
+    plist_path = os.path.join(la_dir, f"{SLEEPWATCHER_LABEL}.plist")
+    home = os.path.expanduser("~")
     plist = (
         '<?xml version="1.0" encoding="UTF-8"?>\n'
         '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" '
         '"http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n'
         '<plist version="1.0">\n<dict>\n'
-        f'    <key>Label</key><string>{WATCHDOG_MAC_LABEL}</string>\n'
+        f'    <key>Label</key><string>{SLEEPWATCHER_LABEL}</string>\n'
         '    <key>ProgramArguments</key>\n'
-        f'    <array><string>/bin/bash</string><string>{script_path}</string></array>\n'
+        f'    <array><string>{binario}</string>'
+        f'<string>-V</string>'
+        f'<string>-s</string><string>{home}/.sleep</string>'
+        f'<string>-w</string><string>{home}/.wakeup</string>'
+        # -W: solo cuando la PANTALLA despierta (no en dark wakes) — revalida VS Code
+        f'<string>-W</string><string>{home}/.displaywake</string></array>\n'
         '    <key>RunAtLoad</key><true/>\n'
-        '    <key>StartInterval</key><integer>60</integer>\n'
+        '    <key>KeepAlive</key><true/>\n'
         '    <key>LimitLoadToSessionType</key><string>Aqua</string>\n'
-        '    <key>StandardOutPath</key><string>/tmp/nas-wd-lan.out</string>\n'
-        '    <key>StandardErrorPath</key><string>/tmp/nas-wd-lan.err</string>\n'
+        '    <key>StandardOutPath</key><string>/tmp/sleepwatcher.out</string>\n'
+        '    <key>StandardErrorPath</key><string>/tmp/sleepwatcher.err</string>\n'
         '</dict>\n</plist>\n'
     )
-    try:
-        with open(plist_path, "w") as f:
-            f.write(plist)
-        run(f"launchctl unload '{plist_path}'", check=False, capture=True)
-        run(f"launchctl load '{plist_path}'", check=False, capture=True)
-        ok("Reconexión automática configurada (watchdog al iniciar sesión + cada 60s).")
-        return True
-    except Exception:
-        warn("No se pudo activar el watchdog del Mac (no crítico).")
+    if not _escribir_ejecutable(plist_path, plist):
         return False
+    return _cargar_launchagent(plist_path)
+
 
 def _conectar_lan():
     info("Ingresa tus credenciales del NAS:")
@@ -1129,9 +1426,17 @@ def _conectar_lan():
                 ok(f"Unidad {DRIVE_ENSAMBLE} montada.")
 
     elif OS == "Darwin":
+        montados = []
         ok_e = _montar_smb_mac(SHARE_ENSAMBLE, f"/Volumes/{SHARE_ENSAMBLE}", usuario, pwd)
+        if ok_e:
+            montados.append(SHARE_ENSAMBLE)
         if es_admin:
-            ok_a = _montar_smb_mac(SHARE_ARCHIVO, "/Volumes/ARCHIVO_ENSAMBLE", usuario, pwd)
+            # Punto de montaje con el NOMBRE REAL del share (con espacio): lo crea
+            # NetAuthAgent, y es el que el watchdog vigila con `mount`. Antes decía
+            # "ARCHIVO_ENSAMBLE" (guion bajo) y nunca coincidía.
+            ok_a = _montar_smb_mac(SHARE_ARCHIVO, f"/Volumes/{SHARE_ARCHIVO}", usuario, pwd)
+            if ok_a:
+                montados.append(SHARE_ARCHIVO)
             if ok_e and ok_a:
                 ok("Carpetas Ensamble y ARCHIVO ENSAMBLE montadas.")
             elif ok_e:
@@ -1141,7 +1446,10 @@ def _conectar_lan():
                 ok("Carpeta Ensamble montada.")
         info("")
         if ok_e:
-            _instalar_watchdog_mac(usuario, [SHARE_ENSAMBLE])
+            # Se pasan los shares REALMENTE montados: si el usuario es admin y
+            # ARCHIVO ENSAMBLE subió, el watchdog debe vigilar los dos. Antes se
+            # pasaba siempre [SHARE_ENSAMBLE] y el segundo share quedaba huérfano.
+            _instalar_watchdog_mac(usuario, montados)
             info("El montaje se reconecta solo al reiniciar y tras cada suspensión.")
         else:
             info("En Mac el montaje no persiste al reiniciar; vuelve a correr esto para reconectar.")
