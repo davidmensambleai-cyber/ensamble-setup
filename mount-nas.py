@@ -49,6 +49,13 @@ SHARE_ARCHIVO     = "ARCHIVO ENSAMBLE"
 DRIVE_ENSAMBLE    = "Z:"
 DRIVE_ARCHIVO     = "Y:"
 NAS_ADMIN_USERS   = {"admin", "davidm", "juanpablop", "simonf"}
+# Usuarios que trabajan el repo en VS Code. Solo a ellos se les instala la
+# automatizacion de VS Code (apertura al login + revalidacion tras remontaje).
+# Al resto del equipo no le sirve de nada y les mete agentes de arranque.
+# Si un equipo cambia de cuenta NAS, agregar la cuenta nueva aqui el mismo dia:
+# el bloque se desinstala solo y nadie se entera hasta abrir VS Code.
+VSCODE_USERS      = {"davidm"}
+RUTA_PROYECTO_WIN = r"Z:\DTI_Tecnología, innovación y optimización\ensamble-platform"
 # Nombre del tailnet compartido de Ensamble (CurrentTailnet.Name en `tailscale status --json`).
 # Es el mismo para todo el equipo aunque cada colaborador entre con su propia cuenta Google —
 # verificado en vivo contra el NAS 2026-08-19 (todo el User map del JSON comparte este tailnet).
@@ -708,7 +715,8 @@ def enrutar(capas, ubicacion):
     if "crear_tarea_reconexion" in acciones:
         info("")
         if confirm("¿Configurar la reconexión automática al iniciar sesión?"):
-            _instalar_reconexion_startup_win()
+            # El usuario decide si este equipo recibe la automatizacion de VS Code.
+            _instalar_reconexion_startup_win(ask("Usuario NAS"))
             resultado["acciones"].append("crear_tarea_reconexion")
 
     # 6) Instalar la reconexión automática (Mac) — no requiere desmontar nada
@@ -803,7 +811,7 @@ def _lineas_reconexion(chequear):
         lineas.append(f'if not exist {letra}\\ ({cmd})' if chequear else cmd)
     return lineas
 
-def _instalar_reconexion_startup_win():
+def _instalar_reconexion_startup_win(usuario=None):
     """
     Windows reconecta unidades persistentes muy temprano en el arranque, antes de que la
     red/NetBIOS esté lista. Si esa primera reconexión silenciosa falla, la unidad queda
@@ -828,16 +836,59 @@ def _instalar_reconexion_startup_win():
     sesión) que en Mac cubre `_instalar_watchdog_mac()` con un LaunchAgent, sin la firma
     que dispara la alerta.
     """
+    # Solo quien trabaja el repo recibe la parte de VS Code (VSCODE_USERS).
+    quiere_vscode = bool(usuario) and usuario.lower() in VSCODE_USERS
+    proyecto = RUTA_PROYECTO_WIN
+    log_vs = r'"%TEMP%\EnsambleVSCode.log"'
+    # `code -r` reutiliza la ventana activa en vez de abrir una nueva: si VS Code
+    # quedo apuntando a una ruta rota, la reengancha; si ya esta bien, no molesta.
+    abrir_vscode = 'start "" /b cmd /c code -r "' + proyecto + '" >> ' + log_vs + ' 2>&1'
+
     lineas = ["@echo off", "timeout /t 30 /nobreak >nul"]
     for _ in range(2):
         lineas += _lineas_reconexion(chequear=False)
         lineas.append("timeout /t 90 /nobreak >nul")
+
+    if quiere_vscode:
+        # Equivalente Windows de `open-project` en Mac: abrir en el proyecto al
+        # iniciar sesion, una vez que la unidad de verdad responde.
+        # NAS_CAIDA=1 cuando la apertura inicial NO pudo hacerse (unidad todavia
+        # no lista): asi el bucle la hace en cuanto la unidad aparezca, en vez de
+        # esperar a una caida posterior que quiza nunca ocurra.
+        lineas += [
+            'if not exist "' + proyecto + '\\" goto sin_apertura',
+            'echo %DATE% %TIME% apertura inicial >> ' + log_vs,
+            abrir_vscode,
+            "set NAS_CAIDA=0",
+            "goto bucle",
+            ":sin_apertura",
+            "set NAS_CAIDA=1",
+        ]
+
     lineas += [
         ":bucle",
         "timeout /t 600 /nobreak >nul",
-    ] + _lineas_reconexion(chequear=True) + [
-        "goto bucle",
     ]
+    # Se marca ANTES de reconectar: despues de `net use` la unidad ya existe y
+    # seria imposible saber que se habia caido.
+    if quiere_vscode:
+        lineas.append("if not exist " + DRIVE_ENSAMBLE + "\\ set NAS_CAIDA=1")
+
+    lineas += _lineas_reconexion(chequear=True)
+
+    if quiere_vscode:
+        # Equivalente Windows de `revalidar-vscode.sh`: solo actua si la unidad se
+        # cayo y volvio. Lineas planas, sin bloques entre parentesis, para no
+        # depender de la expansion retardada de variables en un bucle `goto`.
+        lineas += [
+            "if not exist " + DRIVE_ENSAMBLE + "\\ goto bucle",
+            'if "%NAS_CAIDA%"=="0" goto bucle',
+            "set NAS_CAIDA=0",
+            "echo %DATE% %TIME% unidad recuperada, revalidando VS Code >> " + log_vs,
+            abrir_vscode,
+        ]
+
+    lineas.append("goto bucle")
 
     destino = os.path.join(_startup_folder(), "EnsambleReconectarNAS.bat")
     try:
@@ -845,6 +896,10 @@ def _instalar_reconexion_startup_win():
         with open(destino, "w", encoding="utf-8") as f:
             f.write("\r\n".join(lineas) + "\r\n")
         ok("Reconexión automática configurada (arranque + verificación cada 10 min).")
+        if quiere_vscode:
+            ok("VS Code abrirá en el proyecto al iniciar sesión y tras recuperar la unidad.")
+        elif usuario:
+            info(f"Usuario {usuario}: sin automatización de VS Code (solo para quien trabaja el repo).")
         return True
     except Exception:
         warn("No se pudo configurar la reconexión automática (no crítico).")
@@ -879,7 +934,7 @@ def _montar_unidad_win(letra, share, usuario, password, host=NAS_HOST_ALIAS):
     result = run(cmd, check=False)
     if result.returncode == 0:
         ok(f"{letra} → {unc}")
-        _instalar_reconexion_startup_win()
+        _instalar_reconexion_startup_win(usuario)
         return True
     else:
         err(f"No se pudo montar {letra}.")
@@ -1280,14 +1335,7 @@ if [ "$pendiente" -eq 1 ]; then
     fi
 fi
 
-# FIX-015 - corre SIEMPRE, incluso en los ticks donde no hubo nada que montar:
-# tras un remontaje exitoso el estado normal es "todo montado, sello pendiente".
-# El script decide solo si hay algo que hacer; aqui no se filtra nada.
-if [ -x "$REVALIDAR" ]; then
-    "$REVALIDAR"
-else
-    log "AVISO: falta $REVALIDAR -> VS Code no se revalidara tras un remontaje"
-fi
+__REVALIDAR_BLOQUE__
 exit 0
 '''
 
@@ -1343,6 +1391,41 @@ def _cargar_launchagent(plist_path):
     return r.returncode == 0
 
 
+def _desinstalar_vscode_mac(bin_dir, la_dir):
+    """Retira la automatizacion de VS Code de un Mac cuyo usuario NAS no la necesita.
+
+    Se llama cuando el equipo YA la tenia y cambio de usuario, o cuando una version
+    vieja de este script la instalaba a todo el mundo. Devuelve lo que quito, para
+    poder decirlo en pantalla en vez de hacerlo callado.
+    """
+    quitados = []
+    plist = os.path.join(la_dir, f"{OPEN_PROJECT_MAC_LABEL}.plist")
+    if os.path.exists(plist):
+        run(f"launchctl unload '{plist}'", check=False, capture=True)
+        try:
+            os.remove(plist)
+            quitados.append("LaunchAgent open-project")
+        except Exception:
+            pass
+    for nombre in ("open-project.sh", "revalidar-vscode.sh"):
+        ruta = os.path.join(bin_dir, nombre)
+        if os.path.exists(ruta):
+            try:
+                os.remove(ruta)
+                quitados.append(nombre)
+            except Exception:
+                pass
+    # Resto de FIX-013 por si el equipo viene de una version anterior a FIX-015.
+    dw = os.path.expanduser("~/.displaywake")
+    if os.path.exists(dw):
+        try:
+            os.remove(dw)
+            quitados.append("~/.displaywake")
+        except Exception:
+            pass
+    return quitados
+
+
 def _instalar_watchdog_mac(usuario, shares):
     """Instala la reconexión automática del NAS en un Mac de oficina.
 
@@ -1370,13 +1453,37 @@ def _instalar_watchdog_mac(usuario, shares):
 
     shares_bash = " ".join(f'"{s}"' for s in shares)
 
+    # Solo quien trabaja el repo recibe la automatizacion de VS Code (VSCODE_USERS).
+    # Al resto no le sirve y le deja agentes de arranque que nadie pidio.
+    quiere_vscode = usuario.lower() in VSCODE_USERS
+
+    if quiere_vscode:
+        revalidar_bloque = (
+            '# FIX-015 - corre SIEMPRE, incluso en los ticks donde no hubo nada que montar:\n'
+            '# tras un remontaje exitoso el estado normal es "todo montado, sello pendiente".\n'
+            '# El script decide solo si hay algo que hacer; aqui no se filtra nada.\n'
+            'if [ -x "$REVALIDAR" ]; then\n'
+            '    "$REVALIDAR"\n'
+            'else\n'
+            '    log "AVISO: falta $REVALIDAR -> VS Code no se revalidara tras un remontaje"\n'
+            'fi'
+        )
+    else:
+        # Sin la llamada, no solo sin el script: dejarla puesta escribiria el AVISO
+        # cada 60 s en un equipo donde el script falta A PROPOSITO.
+        revalidar_bloque = (
+            '# Sin revalidacion de VS Code: el usuario NAS de este equipo no esta en\n'
+            '# VSCODE_USERS (mount-nas.py). No es un olvido, es deliberado.'
+        )
+
     # ── 1. Watchdog ───────────────────────────────────────────────
     wd_path = os.path.join(bin_dir, "nas-watchdog-mac.sh")
     wd = (WATCHDOG_MAC_SH
           .replace("__HOST_ALIAS__", NAS_HOST_ALIAS)
           .replace("__LAN_IP__", NAS_LAN_IP)
           .replace("__NAS_USER__", usuario)
-          .replace("__SHARES__", shares_bash))
+          .replace("__SHARES__", shares_bash)
+          .replace("__REVALIDAR_BLOQUE__", revalidar_bloque))
     if not _escribir_ejecutable(wd_path, wd):
         warn("No se pudo escribir el watchdog del Mac (no crítico).")
         return False
@@ -1390,24 +1497,30 @@ def _instalar_watchdog_mac(usuario, shares):
     _cargar_launchagent(wd_plist)
     ok("Reconexión automática configurada (al iniciar sesión y cada 60s).")
 
-    # ── 2. open-project ───────────────────────────────────────────
-    op_path = os.path.join(bin_dir, "open-project.sh")
-    if _escribir_ejecutable(op_path, OPEN_PROJECT_SH):
-        op_plist = os.path.join(la_dir, f"{OPEN_PROJECT_MAC_LABEL}.plist")
-        if _escribir_ejecutable(op_plist, _plist_launchagent(
-                OPEN_PROJECT_MAC_LABEL, op_path, run_at_load=True, interval=None,
-                out_log="/tmp/open-project.out", err_log="/tmp/open-project.err")):
-            _cargar_launchagent(op_plist)
-            ok("VS Code se abrirá en el proyecto al iniciar sesión.")
+    # ── 2. VS Code: open-project + revalidacion (solo VSCODE_USERS) ──
+    if quiere_vscode:
+        op_path = os.path.join(bin_dir, "open-project.sh")
+        if _escribir_ejecutable(op_path, OPEN_PROJECT_SH):
+            op_plist = os.path.join(la_dir, f"{OPEN_PROJECT_MAC_LABEL}.plist")
+            if _escribir_ejecutable(op_plist, _plist_launchagent(
+                    OPEN_PROJECT_MAC_LABEL, op_path, run_at_load=True, interval=None,
+                    out_log="/tmp/open-project.out", err_log="/tmp/open-project.err")):
+                _cargar_launchagent(op_plist)
+                ok("VS Code se abrirá en el proyecto al iniciar sesión.")
+        # FIX-015: la revalidacion ya no es un hook de sleepwatcher (-W es un
+        # disparador muerto). Vive junto al watchdog, que la invoca cada 60 s.
+        _escribir_ejecutable(os.path.join(bin_dir, "revalidar-vscode.sh"), REVALIDAR_VSCODE_SH)
+    else:
+        quitados = _desinstalar_vscode_mac(bin_dir, la_dir)
+        if quitados:
+            ok("Automatización de VS Code retirada: " + ", ".join(quitados) + ".")
+        info(f"Usuario {usuario}: sin automatización de VS Code (solo para quien trabaja el repo).")
 
     # ── 3. Hooks de sleep/wake (requieren sleepwatcher) ───────────
     sleep_path = os.path.expanduser("~/.sleep")
     wake_path = os.path.expanduser("~/.wakeup")
     _escribir_ejecutable(sleep_path, SLEEP_UNMOUNT_SH.replace("__SHARES__", shares_bash))
     _escribir_ejecutable(wake_path, WAKEUP_REMOUNT_SH)
-    # FIX-015: la revalidacion de VS Code ya no es un hook de sleepwatcher (-W
-    # es un disparador muerto). Vive junto al watchdog, que la invoca cada 60 s.
-    _escribir_ejecutable(os.path.join(bin_dir, "revalidar-vscode.sh"), REVALIDAR_VSCODE_SH)
 
     if _sleepwatcher_instalado():
         _cargar_sleepwatcher()

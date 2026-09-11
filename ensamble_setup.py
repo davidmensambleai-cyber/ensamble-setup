@@ -1389,9 +1389,14 @@ def seccion_software_basico():
 
     if not IS_WIN:
         warn("Esta sección usa winget (Windows). En Mac, instalar manualmente vía Homebrew — fuera de este alcance por ahora.")
-        info("VS Code en Mac no tiene un mecanismo de Dock con argumentos anclables — no automatizable")
-        info("desde este script. Abre el proyecto una vez (Cmd+O o File → Open Folder) y VS Code lo")
-        info("recuerda solo en los siguientes lanzamientos desde el Dock (window.restoreWindows, default).")
+        # Consejo corregido 2026-09-11. Decia "abre el proyecto una vez y VS Code lo
+        # recuerda" (window.restoreWindows) — eso es FIX-003 y FIX-007 demostro que NO
+        # basta: si el share se desmonta (suspension) VS Code queda sobre una ruta rota
+        # y no la recupera solo. En Mac eso lo resuelve mount-nas.py, no este script.
+        info("VS Code en Mac no se ancla al Dock con argumentos, pero NO hay que abrirlo a mano:")
+        info("  correr `mount-nas` instala la apertura en el proyecto al iniciar sesión y la")
+        info("  revalidación tras cada remontaje del NAS (solo para los usuarios de VSCODE_USERS).")
+        info("  Confiar en window.restoreWindows no alcanza — ver FIX-007 y FIX-015.")
         return
 
     info("Fuente: config_parque_tecnologico.json → software.todos_los_equipos_ensamble")
