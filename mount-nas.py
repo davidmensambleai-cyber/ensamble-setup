@@ -1052,8 +1052,10 @@ REVALIDAR_VSCODE_SH = r'''#!/bin/bash
 # archivos que no cargan). El watchdog no arregla eso porque no es un problema
 # de montaje.
 #
-# Lo invoca el watchdog (nas-watchdog-mac.sh) en CADA corrida — cada 60 s bajo
-# launchd. NO hay disparador de eventos: el watchdog pregunta por estado.
+# Lo invoca el watchdog del equipo en CADA corrida — cada 60 s bajo launchd.
+# NO hay disparador de eventos: el watchdog pregunta por estado. Este texto es
+# identico en las dos variantes de Mac (oficina por LAN, MacBook por Tailscale):
+# los watchdogs difieren, la revalidacion no. Fuente unica: esta constante.
 #
 # -- FIX-015 (2026-09-11): por que ya NO lo dispara sleepwatcher -------------
 # FIX-013 dejo esta revalidacion colgada de `sleepwatcher -W` (~/.displaywake).
