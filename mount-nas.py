@@ -992,12 +992,13 @@ SLEEP_UNMOUNT_SH = r'''#!/bin/bash
 # sobrevive hasta que alguien lo desmonta a mano. Prevenirlo aqui es la unica
 # defensa. ~/.wakeup vuelve a montar al despertar.
 #
-# Deja un MARCADOR para ~/.displaywake: si hubo desmontaje, VS Code se quedo con
-# la carpeta del proyecto bajo los pies y hay que revalidarla cuando el usuario
-# vuelva. Sin el marcador no se toca VS Code (no robar foco en cada despertar).
+# FIX-013 (2026-09-09): este hook ya NO deja marcador para la revalidacion de
+# VS Code. Dejo de depender de el porque su ejecucion puede terminar DESPUES
+# del despertar (umount de SMB congelado durante el sleep), cuando el consumidor
+# del marcador ya habria corrido. Ahora el watchdog sella cada montaje y
+# revalidar-vscode.sh compara sellos. Aqui solo queda el desmontaje limpio.
 
 LOG="/tmp/nas-sleepwake.log"
-MARCADOR="/tmp/nas-remontaje-pendiente"
 log() { echo "$(date '+%F %T') [sleep] $1" >> "$LOG"; }
 
 if [ -f "$LOG" ] && [ "$(stat -f%z "$LOG" 2>/dev/null || echo 0)" -gt 262144 ]; then
@@ -1016,7 +1017,6 @@ for share in __SHARES__; do
     fi
 done
 
-[ "$desmontados" -gt 0 ] && touch "$MARCADOR"
 log "durmiendo (shares desmontados: $desmontados)"
 exit 0
 '''
@@ -1027,8 +1027,8 @@ WAKEUP_REMOUNT_SH = r'''#!/bin/bash
 #
 # Solo remonta. NO toca VS Code: en un dark wake la pantalla sigue apagada y el
 # usuario no esta, asi que abrir una app ahi es robar foco a nadie. De eso se
-# encarga ~/.displaywake, que sleepwatcher dispara con -W (cuando la pantalla
-# despierta de verdad).
+# encarga revalidar-vscode.sh, que el watchdog invoca cada 60 s y que decide por
+# tiempo de inactividad (HIDIdleTime), no por eventos (FIX-015).
 #
 # El watchdog ya espera a que el NAS acepte TCP/445 antes de montar, asi que
 # aqui no hace falta adivinar cuanto tarda la red en volver.
@@ -1044,48 +1044,90 @@ log "watchdog terminado (shares montados ahora: $montados)"
 exit 0
 '''
 
-DISPLAYWAKE_SH = r'''#!/bin/bash
-# ~/.displaywake — lo ejecuta sleepwatcher (-W) cuando la PANTALLA despierta.
-# Generado por mount-nas.py; no editar a mano aqui.
+REVALIDAR_VSCODE_SH = r'''#!/bin/bash
+# revalidar-vscode.sh — Reabre/enfoca la carpeta del proyecto en VS Code cuando
+# el share del NAS se fue y volvio. Generado por mount-nas.py; no editar a mano.
 #
-# Resuelve el hueco que dejaba el diseno anterior: al dormir, ~/.sleep desmonta
-# el share mientras VS Code tiene la carpeta del proyecto abierta. Al despertar
-# se remonta bien, pero VS Code se quedo apuntando a una ruta que desaparecio y
-# volvio — file watchers rotos, archivos que no cargan. El watchdog no arregla
-# eso porque no es un problema de montaje.
+# VS Code queda apuntando a una ruta que desaparecio (file watchers rotos,
+# archivos que no cargan). El watchdog no arregla eso porque no es un problema
+# de montaje.
 #
-# Se dispara con -W y no con -w a proposito: -w salta tambien en dark wakes
-# (decenas al dia, pantalla apagada, usuario ausente) y abrir una app ahi no
-# sirve de nada. -W solo salta cuando la pantalla se enciende de verdad.
+# Lo invoca el watchdog (nas-watchdog-mac.sh) en CADA corrida — cada 60 s bajo
+# launchd. NO hay disparador de eventos: el watchdog pregunta por estado.
 #
-# Y solo actua si ~/.sleep dejo el MARCADOR, es decir si de verdad hubo un
-# desmontaje que revalidar. Sin marcador no se toca VS Code: despertar la
-# pantalla no deberia reordenar las ventanas de nadie.
+# -- FIX-015 (2026-09-11): por que ya NO lo dispara sleepwatcher -------------
+# FIX-013 dejo esta revalidacion colgada de `sleepwatcher -W` (~/.displaywake).
+# Ese disparador NO FUNCIONA. Evidencia medida en las dos maquinas:
+#   MacBook de David  — 8 encendidos de pantalla en 14 h, 3 con sello de
+#                       remontaje sin consumir, 0 ejecuciones del hook.
+#   ENS-MAC-DSK-01    — unicas 2 lineas [display] del log son las corridas
+#                       manuales de instalacion (2026-09-07 y 2026-09-09);
+#                       el remontaje real de 2026-09-11 11:23:46 quedo
+#                       2 h 20 min sin consumir.
+# `-s` y `-w` si disparan: los ciclos de desmontaje/remontaje lo prueban. Solo
+# `-W` esta muerto, aunque el man page diga que corre tambien al despertar.
+#
+# La causa de las 5 reincidencias no fue la logica sino el METODO DE
+# VERIFICACION: FIX-012 y FIX-013 se validaron corriendo el script a mano. Eso
+# prueba la logica, no que macOS invoque el hook.
+#
+# Regla que queda: un fix de automatizacion no esta verificado hasta que se lo
+# observa dispararse SOLO, en un ciclo real.
 
 PROJECT="/Volumes/Ensamble/DTI_Tecnología, innovación y optimización/ensamble-platform"
 MOUNTPOINT="/Volumes/Ensamble"
-MARCADOR="/tmp/nas-remontaje-pendiente"
+STAMP="/tmp/nas-remount-stamp"        # lo sella el watchdog al montar
+DONE="/tmp/nas-revalidado-stamp"      # ultima revalidacion ya aplicada
 LOG="/tmp/nas-sleepwake.log"
-log() { echo "$(date '+%F %T') [display] $1" >> "$LOG"; }
 
-[ -f "$MARCADOR" ] || exit 0
+# Presencia. Sin esto se abriria VS Code en los dark wakes de madrugada, que es
+# lo que FIX-013 intentaba evitar con -W. Aca no se pregunta por la pantalla:
+# ninguna API de display sirve en Apple Silicon (medido 2026-09-11 —
+# IODisplayWrangler no existe, AppleCLCD2.CurrentPowerState y la asercion
+# UserIsActive se quedan en 1 con la pantalla apagada). Se pregunta por lo que
+# de verdad importa: si alguien toco el equipo hace poco.
+IDLE_MAX=1800   # 30 min
 
-# Espera hasta 60s (20 x 3s) a que el watchdog termine de remontar.
-for i in $(seq 1 20); do
-    /sbin/mount | grep -q " on ${MOUNTPOINT} (" && break
-    sleep 3
-done
+log() { echo "$(date '+%F %T') [revalidar] $1" >> "$LOG"; }
+solo_numero() { case "$1" in ''|*[!0-9]*) echo 0 ;; *) echo "$1" ;; esac; }
 
-if ! /sbin/mount | grep -q " on ${MOUNTPOINT} ("; then
-    log "el NAS no volvio a montarse en 60s -> no se toca VS Code (marcador se conserva)"
-    exit 0
-fi
+# Segundos desde la ultima actividad de teclado/mouse. ioreg no pasa por TCC,
+# asi que es fiable bajo launchd (a diferencia de leer un archivo — FIX-009).
+# Si no se puede leer se asume presencia: el fallo historico de este mecanismo
+# fue no actuar nunca, no actuar de mas.
+idle_segundos() {
+    local ns
+    ns=$(ioreg -c IOHIDSystem 2>/dev/null | awk -F' = ' '/HIDIdleTime/{print $2; exit}')
+    case "$ns" in
+        ''|*[!0-9]*) echo 0 ;;
+        *) echo $((ns / 1000000000)) ;;
+    esac
+}
+
+[ -f "$STAMP" ] || exit 0
+cur=$(solo_numero "$(cat "$STAMP" 2>/dev/null)")
+last=$(solo_numero "$(cat "$DONE" 2>/dev/null)")
+
+# Nada se remonto desde la ultima revalidacion -> no se toca VS Code.
+[ "$cur" -gt "$last" ] || exit 0
+
+# El share tiene que estar montado AHORA. Si no, el sello queda pendiente y se
+# reintenta al proximo tick. `mount` es syscall: fiable bajo launchd.
+/sbin/mount | grep -q " on ${MOUNTPOINT} (" || exit 0
+
+# Nadie en el equipo -> no se consume el sello, se revalida cuando vuelva.
+idle=$(idle_segundos)
+[ "$idle" -le "$IDLE_MAX" ] || exit 0
 
 # `open -a` es idempotente: si VS Code ya tiene la carpeta abierta la enfoca y
 # revalida; si quedo con la ruta rota, la reabre; si estaba cerrado, la abre.
-open -a "Visual Studio Code" "$PROJECT" >>"$LOG" 2>&1
-log "NAS remontado -> VS Code revalidado en el proyecto"
-rm -f "$MARCADOR"
+# Con timeout porque esto corre dentro del lock del watchdog: un `open` colgado
+# bloquearia los remontajes (leccion FIX-011, el osascript de una hora).
+perl -e 'alarm 20; exec @ARGV' \
+    /usr/bin/open -a "Visual Studio Code" "$PROJECT" >>"$LOG" 2>&1
+
+echo "$cur" > "$DONE"
+log "remontaje $(date -r "$cur" '+%F %T') (idle ${idle}s) -> VS Code revalidado"
 exit 0
 '''
 
@@ -1128,6 +1170,10 @@ HOST_ALIAS="__HOST_ALIAS__"    # preferido: entrada de /etc/hosts (nas_local)
 LAN_IP="__LAN_IP__"            # respaldo por IP directa
 NAS_USER="__NAS_USER__"
 SHARES=(__SHARES__)
+
+PROJECT_SHARE="Ensamble"          # share que contiene el proyecto (el que le importa a VS Code)
+STAMP_FILE="/tmp/nas-remount-stamp"  # sello de remontaje que consume revalidar-vscode.sh
+REVALIDAR="$HOME/.local/bin/revalidar-vscode.sh"   # FIX-015
 
 LOG="/tmp/nas-wd-lan.log"
 LOCK_DIR="/tmp/nas-wd-lan.lock.d"
@@ -1203,6 +1249,9 @@ montar() {
     sleep 2
     if montado "$share"; then
         log "$share: montado via $destino"
+        # Este script es el unico que SABE que hubo un remontaje. Sella la hora;
+        # revalidar-vscode.sh la consume cuando el usuario este presente.
+        [ "$share" = "$PROJECT_SHARE" ] && date +%s > "$STAMP_FILE"
     else
         log "$share: no se pudo montar via $destino (error o timeout ${MOUNT_TIMEOUT}s; reintenta al proximo ciclo)"
     fi
@@ -1213,21 +1262,30 @@ rotar_logs
 en_ventana_apagado && exit 0
 adquirir_lock || exit 0
 
-# Si no falta montar nada, salir sin tocar la red.
+# Hay algo pendiente de montar? Si no, no se toca la red.
 pendiente=0
 for share in "${SHARES[@]}"; do montado "$share" || pendiente=1; done
-[ "$pendiente" -eq 0 ] && exit 0
 
-DESTINO=$(nas_alcanzable) || {
-    log "NAS no responde en 445 tras ~$((RED_INTENTOS * (RED_PAUSA + NC_TIMEOUT * 2)))s -> no se intenta montar (reintenta al proximo ciclo)"
-    exit 0
-}
+if [ "$pendiente" -eq 1 ]; then
+    if DESTINO=$(nas_alcanzable); then
+        for share in "${SHARES[@]}"; do
+            montado "$share" && continue      # ya esta montado -> NO TOCAR
+            log "$share: no montado -> montando via $DESTINO"
+            montar "$share" "$DESTINO"
+        done
+    else
+        log "NAS no responde en 445 tras ~$((RED_INTENTOS * (RED_PAUSA + NC_TIMEOUT * 2)))s -> no se intenta montar (reintenta al proximo ciclo)"
+    fi
+fi
 
-for share in "${SHARES[@]}"; do
-    montado "$share" && continue      # ya esta montado -> NO TOCAR
-    log "$share: no montado -> montando via $DESTINO"
-    montar "$share" "$DESTINO"
-done
+# FIX-015 - corre SIEMPRE, incluso en los ticks donde no hubo nada que montar:
+# tras un remontaje exitoso el estado normal es "todo montado, sello pendiente".
+# El script decide solo si hay algo que hacer; aqui no se filtra nada.
+if [ -x "$REVALIDAR" ]; then
+    "$REVALIDAR"
+else
+    log "AVISO: falta $REVALIDAR -> VS Code no se revalidara tras un remontaje"
+fi
 exit 0
 '''
 
@@ -1343,10 +1401,11 @@ def _instalar_watchdog_mac(usuario, shares):
     # ── 3. Hooks de sleep/wake (requieren sleepwatcher) ───────────
     sleep_path = os.path.expanduser("~/.sleep")
     wake_path = os.path.expanduser("~/.wakeup")
-    display_path = os.path.expanduser("~/.displaywake")
     _escribir_ejecutable(sleep_path, SLEEP_UNMOUNT_SH.replace("__SHARES__", shares_bash))
     _escribir_ejecutable(wake_path, WAKEUP_REMOUNT_SH)
-    _escribir_ejecutable(display_path, DISPLAYWAKE_SH)
+    # FIX-015: la revalidacion de VS Code ya no es un hook de sleepwatcher (-W
+    # es un disparador muerto). Vive junto al watchdog, que la invoca cada 60 s.
+    _escribir_ejecutable(os.path.join(bin_dir, "revalidar-vscode.sh"), REVALIDAR_VSCODE_SH)
 
     if _sleepwatcher_instalado():
         _cargar_sleepwatcher()
@@ -1389,9 +1448,9 @@ def _cargar_sleepwatcher():
         f'    <array><string>{binario}</string>'
         f'<string>-V</string>'
         f'<string>-s</string><string>{home}/.sleep</string>'
-        f'<string>-w</string><string>{home}/.wakeup</string>'
-        # -W: solo cuando la PANTALLA despierta (no en dark wakes) — revalida VS Code
-        f'<string>-W</string><string>{home}/.displaywake</string></array>\n'
+        # FIX-015: sin -W. Ese disparador esta muerto (0 ejecuciones medidas en
+        # ambas maquinas); la revalidacion de VS Code la hace el watchdog.
+        f'<string>-w</string><string>{home}/.wakeup</string></array>\n'
         '    <key>RunAtLoad</key><true/>\n'
         '    <key>KeepAlive</key><true/>\n'
         '    <key>LimitLoadToSessionType</key><string>Aqua</string>\n'
