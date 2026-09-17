@@ -300,10 +300,14 @@ def _dns_resuelve(host, expected_ip):
     except Exception:
         return False, set()
 
-def _https_responde(host, timeout=6.0):
-    """(respondio, codigo_o_error). Cualquier respuesta HTTP (incl. 401/403) = proxy vivo."""
-    url = f"https://{host}/"
-    ctx = ssl.create_default_context()
+def _https_responde(host, timeout=6.0, esquema="https", puerto=None):
+    """
+    (respondio, codigo_o_error). Cualquier respuesta HTTP (incl. 401/403) = servidor vivo.
+    `esquema`/`puerto` permiten reusar la sonda para HTTP plano en LAN (DSM sin TLS),
+    no solo para el reverse proxy HTTPS externo.
+    """
+    url = f"{esquema}://{host}:{puerto}/" if puerto else f"{esquema}://{host}/"
+    ctx = ssl.create_default_context() if esquema == "https" else None
     try:
         req = urllib.request.Request(url, method="GET")
         with urllib.request.urlopen(req, timeout=timeout, context=ctx) as r:
@@ -565,10 +569,23 @@ def diagnosticar(ubicacion):
                                    "porque la reconexión automática saca la contraseña del llavero: no te la puede preguntar"))
 
         # ── Navegador dentro de la oficina ─────────────────────────
+        # No basta con que exista el alias en hosts (eso solo dice que el nombre resuelve):
+        # hay que probar que algo responde de verdad en el puerto. Caso real 2026-09-09:
+        # el alias existía y la tarjeta salía verde, pero el navegador no entraba — el
+        # bloqueo era el permiso de Red Local de macOS, invisible para este chequeo, pero
+        # un AMBAR en vez de un VERDE ya deja de afirmar algo que el script no comprobó.
         if _hosts_tiene_alias():
-            capas.append(_capa("Navegador dentro de la oficina", VERDE,
-                               f"Listo — puedes entrar escribiendo http://{NAS_HOST_ALIAS}:{DSM_HTTP_PORT} en el navegador",
-                               "para entrar al NAS escribiendo su nombre en el navegador, sin memorizar números"))
+            http_ok, _ = _https_responde(NAS_HOST_ALIAS, timeout=4.0, esquema="http", puerto=DSM_HTTP_PORT)
+            if http_ok:
+                capas.append(_capa("Navegador dentro de la oficina", VERDE,
+                                   f"Listo — puedes entrar escribiendo http://{NAS_HOST_ALIAS}:{DSM_HTTP_PORT} en el navegador",
+                                   "para entrar al NAS escribiendo su nombre en el navegador, sin memorizar números"))
+            else:
+                capas.append(_capa("Navegador dentro de la oficina", AMBAR,
+                                   f"El nombre está configurado pero no respondió al probarlo (http://{NAS_HOST_ALIAS}:{DSM_HTTP_PORT}) — "
+                                   "puede ser un permiso del sistema operativo, no del script",
+                                   "para entrar al NAS escribiendo su nombre en el navegador, sin memorizar números",
+                                   None))
         else:
             capas.append(_capa("Navegador dentro de la oficina", ROJO, "Todavía falta configurarlo",
                                "para entrar al NAS escribiendo su nombre en el navegador, sin memorizar números",
@@ -1876,6 +1893,12 @@ def resumen_final(ubicacion, capas, resultado):
         print(f"     2. Por navegador, dentro de la oficina: http://{NAS_HOST_ALIAS}:{DSM_HTTP_PORT}")
         print(f"        Si escribes https en vez de http sale una advertencia de seguridad:")
         print(f"        es normal en la red local → \"Avanzado → Continuar\".")
+        nav = por_capa.get("Navegador dentro de la oficina")
+        if OS == "Darwin" and nav and nav["estado"] == AMBAR:
+            print()
+            warn("El navegador podría no abrir esa dirección — no es un problema del NAS:")
+            info("Ajustes del Sistema → Privacidad y seguridad → Red local → activa tu")
+            info("navegador (Chrome, Safari, etc.) y ciérralo y ábrelo de nuevo.")
     else:
         ts = por_capa.get("Tailscale")
         if ts and ts["estado"] == VERDE:
