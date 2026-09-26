@@ -448,7 +448,7 @@ def seccion_eliminar_cuenta_desuso():
         return
 
     warn(f"\nEsto eliminará la cuenta '{objetivo}' Y su carpeta C:\\Users\\{objetivo} — es IRREVERSIBLE.")
-    confirmacion = input('  Escribí "si" para continuar: ').strip().lower()
+    confirmacion = input('  Escribe "si" para continuar: ').strip().lower()
     if confirmacion != "si":
         info("Cancelado.")
         return
@@ -1259,7 +1259,7 @@ def select_vendors(scan_results: dict) -> list:
                     return selected
         except ValueError:
             pass
-        print('  Entrada inválida. Intentá de nuevo.')
+        print('  Entrada inválida. Intenta de nuevo.')
 
 
 def confirm_uninstall_profesionales(selected: list, scan_results: dict) -> bool:
@@ -1279,7 +1279,7 @@ def confirm_uninstall_profesionales(selected: list, scan_results: dict) -> bool:
                 print(f'      ... y {len(items) - 3} más')
     print(f'\n{LINE}')
     print('  ⚠  ESTA ACCIÓN ES IRREVERSIBLE')
-    confirmacion = input('\n  Escribí "si" para continuar: ').strip().lower()
+    confirmacion = input('\n  Escribe "si" para continuar: ').strip().lower()
     return confirmacion == 'si'
 
 
@@ -1495,22 +1495,92 @@ def _carpetas_appdata_por_usuario(vendor_ids: list) -> list:
     return carpetas
 
 
-def _rule_exists(rule_name: str) -> bool:
-    result = run(f'netsh advfirewall firewall show rule name="{rule_name}"', check=False, capture=True)
-    return 'No rules match the specified criteria' not in result.stdout
+REGLA_PREFIJO = "EnsambleAislar:"
 
 
-def _bloquear_exe_firewall(exe_path, dry_run: bool = False) -> bool:
-    """Agrega reglas de entrada/salida bloqueando exe_path. Devuelve True si las agregó
-    (o las agregaría, en dry-run) — False si ya existían (evita duplicar en corridas repetidas)."""
-    rule_name = f"EnsambleAislar: {exe_path}"
-    if _rule_exists(rule_name):
+def _ps(comando: str):
+    """Ejecuta un comando de PowerShell y devuelve el CompletedProcess.
+
+    Se usa PowerShell —y no la salida de texto de netsh— en todo chequeo que deba dar un
+    sí/no. netsh traduce sus mensajes al idioma del Windows: el chequeo anterior buscaba la
+    frase 'No rules match the specified criteria', que en un Windows en español nunca
+    aparece, así que concluía siempre "la regla no existe" y duplicaba reglas en cada
+    corrida. Los cmdlets devuelven objetos y booleanos, que no se traducen."""
+    return run(f'powershell -NoProfile -NonInteractive -Command "{comando}"', check=False, capture=True)
+
+
+def _rule_name(exe_path, direccion: str) -> str:
+    """Un nombre distinto por dirección. Antes las reglas de entrada y salida compartían
+    nombre: si una de las dos fallaba al crearse, la corrida siguiente veía el nombre puesto,
+    daba el ejecutable por bloqueado y no reparaba nunca la que faltaba."""
+    return f"{REGLA_PREFIJO} {exe_path} [{direccion}]"
+
+
+def _reglas_existentes() -> set:
+    """Todas las reglas EnsambleAislar ya presentes, en UNA sola consulta al firewall.
+
+    Antes se lanzaba un netsh por ejecutable: sobre una suite CAD completa son miles de
+    procesos y la corrida se iba a decenas de minutos. Devuelve un set de nombres."""
+    result = _ps(
+        f"Get-NetFirewallRule -DisplayName '{REGLA_PREFIJO}*' -ErrorAction SilentlyContinue"
+        " | Select-Object -ExpandProperty DisplayName"
+    )
+    if result.returncode != 0:
+        warn("No se pudo consultar las reglas ya existentes; se asumirá que no hay ninguna.")
+        return set()
+    return {linea.strip() for linea in result.stdout.splitlines() if linea.strip()}
+
+
+def _perfiles_firewall_apagados() -> list:
+    """Perfiles (Domain/Private/Public) con el firewall apagado.
+
+    Reemplaza el chequeo viejo, que buscaba la subcadena 'ON' en toda la salida de netsh:
+    bastaba con que UN perfil estuviera encendido para dar los tres por buenos, y además la
+    palabra 'Configuración' de la salida en español contiene 'ON', con lo que el chequeo daba
+    positivo siempre. Los nombres de perfil no se traducen y Enabled es un booleano."""
+    result = _ps("Get-NetFirewallProfile | ForEach-Object { $_.Name + '=' + $_.Enabled }")
+    if result.returncode != 0:
+        warn("No se pudo consultar el estado del firewall; se continúa sin verificarlo.")
+        return []
+    apagados = []
+    for linea in result.stdout.splitlines():
+        if '=' in linea:
+            nombre, _, estado = linea.strip().partition('=')
+            if estado.strip().lower() not in ('true', '1'):
+                apagados.append(nombre.strip())
+    return apagados
+
+
+def _bloquear_exe_firewall(exe_path, existentes: set, dry_run: bool = False) -> bool:
+    """Crea las reglas de entrada y salida que le falten a exe_path. Devuelve True si creó
+    alguna (o la crearía, en dry-run), False si las dos ya estaban.
+
+    `existentes` es el set devuelto por _reglas_existentes() y se actualiza aquí mismo: así
+    dos rutas repetidas dentro de la misma corrida no cuentan doble."""
+    faltantes = [d for d in ('out', 'in') if _rule_name(exe_path, d) not in existentes]
+    if not faltantes:
         return False
-    if not dry_run:
-        ok_out = run_logged(f'netsh advfirewall firewall add rule name="{rule_name}" dir=out program="{exe_path}" action=block', f'Bloquear salida {exe_path}')
-        ok_in = run_logged(f'netsh advfirewall firewall add rule name="{rule_name}" dir=in program="{exe_path}" action=block', f'Bloquear entrada {exe_path}')
-        if not (ok_out and ok_in):
-            warn(f'    {exe_path} quedó parcial o totalmente sin bloquear.')
+    for direccion in faltantes:
+        nombre = _rule_name(exe_path, direccion)
+        if not dry_run:
+            etiqueta = 'salida' if direccion == 'out' else 'entrada'
+            # Lista de argumentos, NO cadena: run_logged pasa toda cadena por
+            # _quote_exe_path(), que al ver el primer '.exe' de la línea entrecomilla todo
+            # lo que va antes. Sobre un UninstallString del registro eso es correcto; sobre
+            # un comando de netsh produce una línea que empieza con comilla, y cmd.exe toma
+            # 'netsh advfirewall firewall add rule name=...' como el nombre del programa a
+            # ejecutar. Fallaba siempre y la sección reportaba "Bloqueado" sin haber creado
+            # nada. Con una lista, run_logged no entrecomilla ni usa el shell.
+            creada = run_logged(
+                ['netsh', 'advfirewall', 'firewall', 'add', 'rule',
+                 f'name={nombre}', f'dir={direccion}',
+                 f'program={exe_path}', 'action=block'],
+                f'Bloquear {etiqueta} {exe_path}',
+            )
+            if not creada:
+                warn(f'    {exe_path}: falta la regla de {etiqueta}. Se reintenta en la próxima corrida.')
+                continue
+        existentes.add(nombre)
     return True
 
 
@@ -1532,7 +1602,10 @@ REAPLICAR_TASK = "EnsambleReaplicarAislamiento"
 
 
 def _generar_ps_reaplicar(exe_paths: list) -> str:
-    lineas = ",\n    ".join(f'"{p}"' for p in exe_paths)
+    # Comillas SIMPLES para las rutas: en PowerShell una cadena entre comillas dobles
+    # interpola variables, así que una ruta que contenga '$' se corrompería en silencio.
+    # El '' duplicado es como se escapa una comilla simple dentro de una cadena literal.
+    lineas = ",\n    ".join("'" + str(p).replace("'", "''") + "'" for p in exe_paths)
     return (
         "# Generado por Ensamble Setup Tool — reaplica bloqueo de firewall si falta.\n"
         "# No agrega ejecutables nuevos: solo restaura reglas borradas para esta lista.\n"
@@ -1541,11 +1614,12 @@ def _generar_ps_reaplicar(exe_paths: list) -> str:
         ")\n"
         "foreach ($exe in $ejecutables) {\n"
         "    if (-not (Test-Path $exe)) { continue }\n"
-        '    $ruleName = "EnsambleAislar: $exe"\n'
-        '    $existe = netsh advfirewall firewall show rule name="$ruleName" | Select-String "No rules match"\n'
-        "    if ($existe) {\n"
-        '        netsh advfirewall firewall add rule name="$ruleName" dir=out program="$exe" action=block | Out-Null\n'
-        '        netsh advfirewall firewall add rule name="$ruleName" dir=in program="$exe" action=block | Out-Null\n'
+        "    foreach ($dir in @('out','in')) {\n"
+        f"        $ruleName = '{REGLA_PREFIJO} ' + $exe + ' [' + $dir + ']'\n"
+        "        $existe = Get-NetFirewallRule -DisplayName $ruleName -ErrorAction SilentlyContinue\n"
+        "        if (-not $existe) {\n"
+        '            netsh advfirewall firewall add rule name="$ruleName" dir=$dir program="$exe" action=block | Out-Null\n'
+        "        }\n"
         "    }\n"
         "}\n"
     )
@@ -1581,9 +1655,9 @@ def seccion_aislar_software_profesional():
     if dry_run:
         info("[DRY-RUN] Se escaneará y reportará qué se bloquearía, sin tocar el firewall ni crear tareas.")
 
-    estado = run('netsh advfirewall show allprofiles state', capture=True, check=False).stdout
-    if 'ON' not in estado.upper():
-        warn("\nEl firewall de Windows no está activo en los 3 perfiles.")
+    apagados = _perfiles_firewall_apagados()
+    if apagados:
+        warn(f"\nEl firewall de Windows está apagado en: {', '.join(apagados)}.")
         if dry_run:
             info("[DRY-RUN] Se activaría en los 3 perfiles (Dominio/Privado/Público).")
         elif confirm("¿Activarlo ahora (Dominio/Privado/Público)?"):
@@ -1611,7 +1685,7 @@ def seccion_aislar_software_profesional():
                 break
         except ValueError:
             pass
-        print('  Entrada inválida. Intentá de nuevo.')
+        print('  Entrada inválida. Intenta de nuevo.')
 
     carpetas = _carpetas_a_bloquear(seleccion)
     info(f"\nBuscando ejecutables en {len(carpetas)} carpeta(s) conocida(s)...")
@@ -1636,9 +1710,13 @@ def seccion_aislar_software_profesional():
         info("Cancelado.")
         return
 
+    existentes = _reglas_existentes()
+    if existentes:
+        info(f"{len(existentes)} regla(s) de aislamiento ya presentes en el firewall.")
+
     nuevos, ya_existian = 0, 0
     for exe in encontrados:
-        if _bloquear_exe_firewall(exe, dry_run=dry_run):
+        if _bloquear_exe_firewall(exe, existentes, dry_run=dry_run):
             verbo_exe = "Se bloquearía" if dry_run else "Bloqueado"
             info(f"  {verbo_exe}: {exe}")
             nuevos += 1
