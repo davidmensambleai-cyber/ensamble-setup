@@ -17,6 +17,9 @@ import glob
 import shutil
 import time
 import tempfile
+import json
+import hashlib
+from datetime import datetime
 from pathlib import Path
 
 # ─────────────────────────────────────────────
@@ -64,6 +67,8 @@ def title(text):
     print(f"  {text}")
     print("═" * w)
 
+LINE = '─' * 56
+
 def ok(msg):   print(f"  ✔  {msg}")
 def warn(msg): print(f"  ⚠  {msg}")
 def err(msg):  print(f"  ✖  {msg}")
@@ -72,7 +77,13 @@ def info(msg): print(f"     {msg}")
 def ask(prompt, options=None):
     """Input con validación opcional de opciones."""
     while True:
-        val = input(f"\n  → {prompt}: ").strip()
+        try:
+            val = input(f"\n  → {prompt}: ").strip()
+        except EOFError:
+            # stdin cerrado (terminal muerta): cancelar en vez de girar/crashear.
+            # Misma guarda que mount-nas.py.
+            warn("Entrada cerrada (EOF). Cancelando.")
+            raise KeyboardInterrupt
         if not options or val in options:
             return val
         warn(f"Opción inválida. Válidas: {', '.join(options)}")
@@ -182,6 +193,9 @@ def masked_input(prompt: str) -> str:
             tty.setraw(fd)
             while True:
                 ch = sys.stdin.read(1)
+                if ch == '':
+                    # EOF: read(1) devuelve '' para siempre y el bucle giraría al 100% de CPU.
+                    raise KeyboardInterrupt
                 if ch in ('\r', '\n'):
                     print(); break
                 if ch == '\x7f' and chars:
@@ -199,7 +213,9 @@ def _run_ps_script(script_content: str):
     """Escribe un .ps1 temporal y lo ejecuta — evita -Command gigantes y reduce
     (no elimina) la exposición de secretos frente a pasar todo inline en el cmdline."""
     tmp_path = Path(tempfile.gettempdir()) / f"_ensamble_setup_{int(time.time())}.ps1"
-    tmp_path.write_text(script_content, encoding="utf-8")
+    # Con BOM: PowerShell 5.1 lee un .ps1 sin BOM como ANSI y rompe tildes y eñes, también
+    # las de una contraseña (misma razón que _ps_archivo).
+    tmp_path.write_text(script_content, encoding="utf-8-sig")
     try:
         return run(f'powershell -ExecutionPolicy Bypass -File "{tmp_path}"', check=False, capture=True)
     finally:
@@ -479,8 +495,8 @@ def seccion_nombre_equipo():
 
 # ─────────────────────────────────────────────
 # SECCIÓN: DESINSTALACIÓN → BLOATWARE Y SERVICIOS
-# Fuente de verdad: 03_Agents/Data base/capa-c/.../DTI_Tecnología y configuración de
-# equipos/config_parque_tecnologico.json → bloque "bloatware". Solo Windows.
+# Fuente de verdad: 03_Agents/Agentes/transversales/asesor-ti/references/
+# config_parque_tecnologico.json → bloque "bloatware". Solo Windows.
 # ─────────────────────────────────────────────
 
 APPX_BLOATWARE = [
@@ -1209,9 +1225,6 @@ def uninstall_vendor_win(vendor_id: str, found: dict, dry_run: bool):
             _delete_registry_key_recursive(entry['hive'], entry['subkey_full'])
 
 
-LINE = '─' * 56
-
-
 def show_results_profesionales(scan_results: dict):
     print(f'\n{LINE}')
     for i, (vid, result) in enumerate(scan_results.items(), 1):
@@ -1329,11 +1342,16 @@ def seccion_programas_profesionales():
 
 # ─────────────────────────────────────────────
 # SECCIÓN: INSTALACIÓN → SOFTWARE BÁSICO
-# Fuente de verdad: config_parque_tecnologico.json → software.todos_los_equipos_ensamble
-# Solo Windows (winget). Todos los IDs verificados 2026-07-29 con `winget search` real
-# en pc_13 — incluye la corrección de Python.Python.3 (deprecado, ya no existe en el
-# catálogo) → Python.Python.3.13, y Synology/Claude (sí tienen ID, no había que dejarlos
-# manuales como antes).
+# Fuente de verdad (Windows): 03_Agents/Agentes/transversales/asesor-ti/references/
+# config_parque_tecnologico.json → software.todos_los_equipos_ensamble. Todos los IDs
+# verificados 2026-07-29 con `winget search` real en pc_13 — incluye la corrección de
+# Python.Python.3 (deprecado) → Python.Python.3.13, y Synology/Claude (sí tienen ID).
+# Además, en los dos SO:
+#   · entorno de Python de 02_Python (setup_dev --solo-python), para que los scripts de los
+#     agentes (ej. Word/PDF de los consultivos) corran en todo el equipo — decisión de David,
+#     2026-09-28;
+#   · VS Code solo si la NAS está montada con un usuario de VSCODE_USERS.
+# Mac: LuLu + lulu-cli (versiones congeladas) y herramientas de documentos (pandoc, pango).
 # ─────────────────────────────────────────────
 
 SOFTWARE_BASICO_WINGET = [
@@ -1345,18 +1363,70 @@ SOFTWARE_BASICO_WINGET = [
     ("Synology Drive Client", "Synology.DriveClient"),
     ("Claude Desktop", "Anthropic.Claude"),
     ("WinDirStat", "WinDirStat.WinDirStat"),
-    ("Visual Studio Code", "Microsoft.VisualStudioCode"),
 ]
+VSCODE_WINGET = ("Visual Studio Code", "Microsoft.VisualStudioCode")
+
+# Usuarios NAS que trabajan el repo en VS Code. Mantener en sincronía con VSCODE_USERS de
+# mount-nas.py: los dos scripts se descargan por separado y no comparten código.
+VSCODE_USERS = {"davidm"}
+NAS_HOST_ALIAS = "nas_local"
 
 # VS Code anclado a la barra de tareas, abriendo directo el proyecto — ver
 # asesor-ti/fixes/vscode-taskbar-abre-proyecto.md. Misma unidad de red (Z:) que monta
 # mount-nas.py en todo equipo Windows conectado a la red local — ruta fija, no por equipo.
 RUTA_PROYECTO_WIN = r"Z:\DTI_Tecnología, innovación y optimización\ensamble-platform"
+# Un proceso elevado no ve las unidades mapeadas de la sesión normal: si Z: no aparece, se
+# llega al mismo share por UNC con la credencial que guardó mount-nas (cmdkey).
+RUTA_PROYECTO_UNC = rf"\\{NAS_HOST_ALIAS}\Ensamble\DTI_Tecnología, innovación y optimización\ensamble-platform"
+RUTA_PROYECTO_MAC = Path("/Volumes/Ensamble/DTI_Tecnología, innovación y optimización/ensamble-platform")
 VSCODE_LNK_PIN = os.path.join(
     os.environ.get("APPDATA", ""),
     "Microsoft", "Internet Explorer", "Quick Launch", "User Pinned", "TaskBar",
     "Visual Studio Code.lnk",
 )
+
+LULU_APP = Path("/Applications/LuLu.app")
+LULU_CLI = Path("/usr/local/bin/lulu-cli")
+LULU_DMG = "LuLu_4.5.1.dmg"
+LULU_CLI_TGZ = "lulu-cli-v0.2.0-macos-universal.tar.gz"
+# Versiones congeladas de LuLu y lulu-cli, con SHA256SUMS (decisión 2026-09-28: no se actualizan).
+INSTALADORES_LULU_NAS = RUTA_PROYECTO_MAC / "04_Infraestructura" / "instaladores" / "lulu"
+HERRAMIENTAS_DOCUMENTOS_MAC = ["pandoc", "pango"]   # Word y PDF de generar_word/pdf_legal
+
+
+def _usuario_nas():
+    """Usuario NAS con el que está montado el share Ensamble, en minúsculas, o None.
+
+    Mac: sale de `mount` (//DavidM@192.168.2.7/Ensamble on /Volumes/Ensamble ...); macOS
+    conserva las mayúsculas con que se escribió, por eso se compara en minúsculas.
+    Windows: la credencial que mount-nas guarda con cmdkey para nas_local en cada montaje.
+    Se busca el bloque de ese destino y el usuario en él, sin depender de las etiquetas
+    ('User'/'Usuario'), que cambian con el idioma."""
+    if IS_MAC:
+        salida = run("mount", check=False, capture=True).stdout or ""
+        for linea in salida.splitlines():
+            if " on /Volumes/Ensamble (" in linea and linea.startswith("//") and "@" in linea:
+                return linea[2:linea.index("@")].lower()
+        return None
+    salida = run("cmdkey /list", check=False, capture=True).stdout or ""
+    bloque, dentro = [], False
+    for linea in salida.splitlines():
+        if f"target={NAS_HOST_ALIAS}".lower() in linea.lower():
+            dentro = True
+            continue
+        if dentro:
+            if not linea.strip():
+                break
+            bloque.append(linea)
+    for linea in bloque:
+        valor = linea.split(":", 1)[-1].strip().lower()
+        if valor in VSCODE_USERS:
+            return valor
+    return None
+
+
+def _es_usuario_vscode() -> bool:
+    return _usuario_nas() in VSCODE_USERS
 
 
 def _anclar_vscode_proyecto():
@@ -1384,53 +1454,260 @@ def _anclar_vscode_proyecto():
         ok("VS Code anclado ahora abre directo la carpeta del proyecto.")
 
 
+def _winget_instalar(nombre, pkg_id):
+    # winget list -e devuelve 0 si el paquete ya está instalado, distinto de 0 si no
+    # (confirmado real en pc_13) — evita re-descargar instaladores de decenas/cientos
+    # de MB en cada corrida para software que ya estaba.
+    check = run(f'winget list --id {pkg_id} -e', check=False, capture=True)
+    if check.returncode == 0:
+        ok(f"{nombre} ya está instalado — omitido.")
+        return
+    info(f"\n  Instalando {nombre}...")
+    result = run(
+        f'winget install --id {pkg_id} -e --accept-package-agreements --accept-source-agreements',
+        check=False,
+    )
+    if result.returncode == 0:
+        ok(f"{nombre} instalado.")
+    else:
+        err(f"{nombre} — winget devolvió código {result.returncode} (ver el mensaje de winget arriba).")
+
+
+# ─── Entorno de Python (los dos SO) ───
+
+def _ruta_proyecto():
+    if IS_MAC:
+        return RUTA_PROYECTO_MAC if RUTA_PROYECTO_MAC.exists() else None
+    for ruta in (RUTA_PROYECTO_WIN, RUTA_PROYECTO_UNC):
+        if os.path.exists(ruta):
+            return Path(ruta)
+    return None
+
+
+def _usuario_sesion_mac():
+    """La persona de la sesión, no root: este script corre con sudo."""
+    usuario = os.environ.get("SUDO_USER")
+    if usuario and usuario != "root":
+        return usuario
+    try:
+        import pwd
+        uid = os.stat('/dev/console').st_uid
+        return pwd.getpwuid(uid).pw_name if uid != 0 else None
+    except (OSError, KeyError):
+        return None
+
+
+# sudo reemplaza PATH por uno seguro sin Homebrew; sin esto, setup-dev.sh no ve el uv ni el
+# brew ya instalados y baja otro uv a ~/.local/bin.
+PATH_MAC_USUARIO = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+
+
+def _como_usuario_mac(usuario, cmd):
+    return ["sudo", "-u", usuario, "-H", "env", f"PATH={PATH_MAC_USUARIO}", *cmd]
+
+
+def _entorno_python():
+    """Corre setup_dev --solo-python desde el NAS: uv, Python 3.13, UV_PROJECT_ENVIRONMENT
+    persistida y `uv sync` de 02_Python. Debe correr como la persona de la sesión: la
+    variable y el entorno viven en su perfil, no en el de root/administrador."""
+    proyecto = _ruta_proyecto()
+    if not proyecto:
+        warn("No se encontró el proyecto en el NAS. Conecta el NAS (mount-nas) y vuelve a correr esta sección.")
+        return
+    carpeta = proyecto / "02_Python" / "scripts" / "setup_dev"
+    info("Prepara el entorno de Python que usan los scripts de los agentes (Word, PDF, Excel...).")
+    info("Descarga uv y las librerías la primera vez (unos minutos); después solo actualiza.")
+    if not confirm("¿Preparar el entorno de Python?"):
+        return
+    if IS_MAC:
+        usuario = _usuario_sesion_mac()
+        if not usuario:
+            err("No se pudo identificar el usuario de la sesión. Corre esta sección con la sesión abierta.")
+            return
+        cmd = _como_usuario_mac(usuario, ["/bin/sh", str(carpeta / "setup-dev.sh"), "--solo-python"])
+    else:
+        # En los equipos de oficina la cuenta diaria es la administradora (crear_cuenta_admin_
+        # alineada): el proceso elevado es la misma persona y escribe en su HKCU.
+        cmd = ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
+               "-File", str(carpeta / "setup-dev.ps1"), "--solo-python"]
+    if subprocess.run(cmd).returncode == 0:
+        ok("Entorno de Python listo.")
+    else:
+        err("setup_dev terminó con errores (ver arriba).")
+
+
+# ─── Mac: LuLu + lulu-cli ───
+
+def _carpeta_instaladores_lulu():
+    candidatos = []
+    f = globals().get("__file__")
+    if f:
+        candidatos.append(Path(f).resolve().parents[1] / "instaladores" / "lulu")
+    candidatos.append(INSTALADORES_LULU_NAS)
+    return next((c for c in candidatos if (c / "SHA256SUMS").exists()), None)
+
+
+def _verificar_instalador(carpeta: Path, nombre: str) -> bool:
+    esperados = {}
+    for linea in (carpeta / "SHA256SUMS").read_text().splitlines():
+        partes = linea.split()
+        if len(partes) == 2:
+            esperados[partes[1]] = partes[0].lower()
+    if not (carpeta / nombre).exists() or esperados.get(nombre) != _sha256(carpeta / nombre):
+        err(f"{nombre}: falta o su hash no coincide con SHA256SUMS. No se instala.")
+        return False
+    return True
+
+
+def _mac_instalar_lulu(carpeta: Path) -> bool:
+    import plistlib
+    if not _verificar_instalador(carpeta, LULU_DMG):
+        return False
+    r = subprocess.run(['hdiutil', 'attach', '-nobrowse', '-readonly', '-plist', str(carpeta / LULU_DMG)],
+                       capture_output=True)
+    if r.returncode != 0:
+        err(f"No se pudo montar {LULU_DMG}: {r.stderr.decode(errors='replace').strip()}")
+        return False
+    entidades = plistlib.loads(r.stdout).get('system-entities', [])
+    montaje = next((e['mount-point'] for e in entidades if 'mount-point' in e), None)
+    try:
+        apps = sorted(Path(montaje).glob('*.app')) if montaje else []
+        if not apps:
+            err("El DMG no trae ninguna .app en la raíz.")
+            return False
+        return run_logged(['ditto', str(apps[0]), str(Path('/Applications') / apps[0].name)],
+                          f'Copiar {apps[0].name} a /Applications')
+    finally:
+        if montaje:
+            subprocess.run(['hdiutil', 'detach', montaje, '-quiet'])
+
+
+def _mac_instalar_lulu_cli(carpeta: Path) -> bool:
+    import tarfile
+    if not _verificar_instalador(carpeta, LULU_CLI_TGZ):
+        return False
+    with tempfile.TemporaryDirectory() as tmp:
+        with tarfile.open(carpeta / LULU_CLI_TGZ) as tf:
+            tf.extract(tf.getmember('lulu-cli'), tmp)
+        LULU_CLI.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(Path(tmp) / 'lulu-cli', LULU_CLI)
+    os.chown(LULU_CLI, 0, 0)
+    os.chmod(LULU_CLI, 0o755)
+    ok(f"lulu-cli instalado en {LULU_CLI}.")
+    return True
+
+
+def _mac_lulu_extension_activa() -> bool:
+    r = subprocess.run(['systemextensionsctl', 'list'], capture_output=True, text=True)
+    return any('com.objective-see.lulu' in l and '[activated enabled]' in l for l in r.stdout.splitlines())
+
+
+def _mac_lulu():
+    """Instala desde el NAS lo que falte, verificando SHA256SUMS, y guía la configuración
+    manual: macOS no deja automatizar la aprobación de una extensión de red."""
+    info("LuLu filtra la salida a internet por programa (lo usa Instalación → 3 Aislador + Centinela).")
+    carpeta = _carpeta_instaladores_lulu()
+    for falta, nombre, instalar in ((not LULU_APP.exists(), LULU_DMG, _mac_instalar_lulu),
+                                    (not LULU_CLI.exists(), LULU_CLI_TGZ, _mac_instalar_lulu_cli)):
+        if not falta:
+            continue
+        warn(f"Falta {nombre.split('_')[0].split('-v')[0]}.")
+        if not carpeta:
+            err("No se encontró la carpeta de instaladores del NAS (04_Infraestructura/instaladores/lulu). ¿Está montado?")
+            return
+        if not confirm(f"¿Instalar {nombre} desde el NAS?") or not instalar(carpeta):
+            return
+
+    if _mac_lulu_extension_activa():
+        ok("LuLu y lulu-cli listos, con la extensión de red activa.")
+        return
+    warn("La extensión de red de LuLu no está activa. Pasos manuales (una sola vez):")
+    info("1. Abre LuLu desde Aplicaciones y sigue su asistente.")
+    info("2. Aprueba la extensión en Configuración del Sistema → General →")
+    info("   Ítems de inicio y extensiones → Extensiones de red.")
+    info("3. En la configuración de LuLu: activa el modo pasivo permitiendo lo desconocido")
+    info("   (así solo actúan las reglas de Ensamble) y desactiva la búsqueda de actualizaciones.")
+    input("\n  Presiona Enter cuando hayas terminado...")
+    if _mac_lulu_extension_activa():
+        ok("LuLu y lulu-cli listos, con la extensión de red activa.")
+    else:
+        err("La extensión sigue inactiva: sin ella LuLu no filtra nada. Vuelve a esta sección cuando la apruebes.")
+
+
+# ─── Mac: herramientas de documentos ───
+
+def _brew_mac():
+    return next((b for b in ("/opt/homebrew/bin/brew", "/usr/local/bin/brew") if os.path.exists(b)), None)
+
+
+def _mac_herramientas_documentos():
+    """pandoc (Word) y pango (PDF directo) vía Homebrew. En Windows no hacen falta: pandoc
+    viene dentro del paquete de Python y el PDF sale por Word."""
+    brew, usuario = _brew_mac(), _usuario_sesion_mac()
+    if not brew:
+        warn("Homebrew no está instalado: sin él no se instalan pandoc ni pango (Word y PDF de los agentes).")
+        info('Instálalo desde https://brew.sh (pega el comando en Terminal, SIN sudo) y vuelve a esta sección.')
+        return
+    if not usuario:
+        err("No se pudo identificar el usuario de la sesión.")
+        return
+    faltan = [p for p in HERRAMIENTAS_DOCUMENTOS_MAC
+              if subprocess.run(_como_usuario_mac(usuario, [brew, "list", "--versions", p]),
+                                capture_output=True).returncode != 0]
+    if not faltan:
+        ok("pandoc y pango ya están instalados.")
+        return
+    if not confirm(f"¿Instalar {', '.join(faltan)} con Homebrew? (Word y PDF de los agentes)"):
+        return
+    # Homebrew se niega a correr como root: se instala a nombre de la persona de la sesión.
+    if run_logged(_como_usuario_mac(usuario, [brew, "install", *faltan]), f"brew install {' '.join(faltan)}"):
+        ok(f"{', '.join(faltan)} instalado(s).")
+
+
 def seccion_software_basico():
     title("INSTALACIÓN · SOFTWARE BÁSICO")
+    vscode = _es_usuario_vscode()
 
-    if not IS_WIN:
-        warn("Esta sección usa winget (Windows). En Mac, instalar manualmente vía Homebrew — fuera de este alcance por ahora.")
-        # Consejo corregido 2026-09-11. Decia "abre el proyecto una vez y VS Code lo
-        # recuerda" (window.restoreWindows) — eso es FIX-003 y FIX-007 demostro que NO
-        # basta: si el share se desmonta (suspension) VS Code queda sobre una ruta rota
-        # y no la recupera solo. En Mac eso lo resuelve mount-nas.py, no este script.
-        info("VS Code en Mac no se ancla al Dock con argumentos, pero NO hay que abrirlo a mano:")
-        info("  correr `mount-nas` instala la apertura en el proyecto al iniciar sesión y la")
-        info("  revalidación tras cada remontaje del NAS (solo para los usuarios de VSCODE_USERS).")
-        info("  Confiar en window.restoreWindows no alcanza — ver FIX-007 y FIX-015.")
+    if IS_MAC:
+        print("\n  ─ LuLu + lulu-cli ─")
+        _mac_lulu()
+        print("\n  ─ Herramientas de documentos (pandoc, pango) ─")
+        _mac_herramientas_documentos()
+        print("\n  ─ Entorno de Python ─")
+        _entorno_python()
+        if vscode:
+            # Consejo corregido 2026-09-11. Decia "abre el proyecto una vez y VS Code lo
+            # recuerda" (window.restoreWindows) — eso es FIX-003 y FIX-007 demostro que NO
+            # basta: si el share se desmonta (suspension) VS Code queda sobre una ruta rota
+            # y no la recupera solo. En Mac eso lo resuelve mount-nas.py, no este script.
+            print("\n  ─ VS Code ─")
+            info("VS Code en Mac no se ancla al Dock con argumentos, pero NO hay que abrirlo a mano:")
+            info("  correr `mount-nas` instala la apertura en el proyecto al iniciar sesión y la")
+            info("  revalidación tras cada remontaje del NAS (solo para los usuarios de VSCODE_USERS).")
+            info("  Confiar en window.restoreWindows no alcanza — ver FIX-007 y FIX-015.")
+        ok("\nSección software básico completada.")
         return
 
+    paquetes = SOFTWARE_BASICO_WINGET + ([VSCODE_WINGET] if vscode else [])
     info("Fuente: config_parque_tecnologico.json → software.todos_los_equipos_ensamble")
-    info(f"\n  Se revisarán {len(SOFTWARE_BASICO_WINGET)} paquete(s) via winget (se omite el que ya esté instalado):")
-    for nombre, _ in SOFTWARE_BASICO_WINGET:
+    info(f"\n  Se revisarán {len(paquetes)} paquete(s) via winget (se omite el que ya esté instalado):")
+    for nombre, _ in paquetes:
         info(f"    - {nombre}")
+    if not vscode:
+        info("  (VS Code se omite: solo se instala si el NAS está montado con un usuario de VSCODE_USERS.)")
 
-    if not confirm(f"\n¿Instalar los {len(SOFTWARE_BASICO_WINGET)} paquetes via winget?"):
-        return
+    if confirm(f"\n¿Instalar los {len(paquetes)} paquetes via winget?"):
+        for nombre, pkg_id in paquetes:
+            _winget_instalar(nombre, pkg_id)
+        if vscode:
+            print()
+            _anclar_vscode_proyecto()
 
-    for nombre, pkg_id in SOFTWARE_BASICO_WINGET:
-        # winget list -e devuelve 0 si el paquete ya está instalado, distinto de 0 si no
-        # (confirmado real en pc_13) — evita re-descargar instaladores de decenas/cientos
-        # de MB en cada corrida para software que ya estaba.
-        check = run(f'winget list --id {pkg_id} -e', check=False, capture=True)
-        if check.returncode == 0:
-            ok(f"{nombre} ya está instalado — omitido.")
-            continue
-
-        info(f"\n  Instalando {nombre}...")
-        result = run(
-            f'winget install --id {pkg_id} -e --accept-package-agreements --accept-source-agreements',
-            check=False,
-        )
-        if result.returncode == 0:
-            ok(f"{nombre} instalado.")
-        else:
-            err(f"{nombre} — winget devolvió código {result.returncode} (ver el mensaje de winget arriba).")
-
-    print()
-    _anclar_vscode_proyecto()
+    print("\n  ─ Entorno de Python ─")
+    info("Word sale con pandoc incluido en el entorno; el PDF de los agentes, por Word (--formato pdf).")
+    _entorno_python()
 
     ok("\nSección software básico completada.")
-
 
 # ─────────────────────────────────────────────
 # SECCIÓN: INSTALACIÓN → SOFTWARE PROFESIONAL (placeholder)
@@ -1444,11 +1721,20 @@ def seccion_software_profesional():
 
 
 # ─────────────────────────────────────────────
-# SECCIÓN: INSTALACIÓN → AISLAR SOFTWARE PROFESIONAL DE INTERNET
+# SECCIÓN: INSTALACIÓN → AISLADOR + CENTINELA
 # Política de oficina: ningún programa profesional ni sus dependencias/licencias
-# puede tener acceso a internet. Reutiliza VENDORS['<id>']['win']['path_globs']
-# (la misma fuente de verdad ya validada para Programas profesionales) — bloquea
-# en vez de borrar. Solo Windows (netsh advfirewall).
+# puede tener acceso a internet. Dos mitades:
+#   · Aislar proveedores: bloquea por firewall cada ejecutable de las carpetas de los
+#     proveedores elegidos (reutiliza VENDORS[...]['win'|'mac'], la misma fuente de verdad
+#     de Programas profesionales). Esas carpetas quedan registradas como "zonas aprobadas".
+#   · Centinela: baseline del equipo + detección lunes y viernes 13:30. Lo nuevo dentro de
+#     una zona aprobada se bloquea provisionalmente; todo lo detectado sale en una pantalla
+#     automática donde se elige qué queda bloqueado (lo demás pasa a la whitelist).
+# Windows: firewall de Windows + tareas programadas en PowerShell. Aunque desde 2026-09-28
+# todo equipo tiene Python (Software básico), ese entorno vive en el perfil de cada persona:
+# una tarea que corre como SYSTEM no puede depender de él. Mac: LuLu + lulu-cli para la
+# salida (se instalan en Software básico), socketfilterfw para la entrada, launchd.
+# Documentación: README-aislar-internet.md.
 # ─────────────────────────────────────────────
 
 SHARED_LICENSING_PATHS = [
@@ -1593,68 +1879,150 @@ def _carpetas_a_bloquear(vendor_ids: list) -> list:
     return carpetas
 
 
-# ─── Reafirmación periódica (restaura reglas borradas — ej. por Asociado, que ───
-# ─── ahora es admin y puede desactivar el firewall o borrar reglas a mano)    ───
+# ─── Estado del centinela (compartido con los scripts de las tareas programadas) ───
 
-REAPLICAR_DIR = Path(r"C:\ProgramData\EnsambleSetup")
-REAPLICAR_SCRIPT = REAPLICAR_DIR / "reaplicar_aislamiento.ps1"
-REAPLICAR_TASK = "EnsambleReaplicarAislamiento"
-
-
-def _generar_ps_reaplicar(exe_paths: list) -> str:
-    # Comillas SIMPLES para las rutas: en PowerShell una cadena entre comillas dobles
-    # interpola variables, así que una ruta que contenga '$' se corrompería en silencio.
-    # El '' duplicado es como se escapa una comilla simple dentro de una cadena literal.
-    lineas = ",\n    ".join("'" + str(p).replace("'", "''") + "'" for p in exe_paths)
-    return (
-        "# Generado por Ensamble Setup Tool — reaplica bloqueo de firewall si falta.\n"
-        "# No agrega ejecutables nuevos: solo restaura reglas borradas para esta lista.\n"
-        "$ejecutables = @(\n"
-        f"    {lineas}\n"
-        ")\n"
-        "foreach ($exe in $ejecutables) {\n"
-        "    if (-not (Test-Path $exe)) { continue }\n"
-        "    foreach ($dir in @('out','in')) {\n"
-        f"        $ruleName = '{REGLA_PREFIJO} ' + $exe + ' [' + $dir + ']'\n"
-        "        $existe = Get-NetFirewallRule -DisplayName $ruleName -ErrorAction SilentlyContinue\n"
-        "        if (-not $existe) {\n"
-        '            netsh advfirewall firewall add rule name="$ruleName" dir=$dir program="$exe" action=block | Out-Null\n'
-        "        }\n"
-        "    }\n"
-        "}\n"
-    )
+CENTINELA_DIR = (Path(r"C:\ProgramData\EnsambleSetup\centinela") if IS_WIN
+                 else Path("/Library/Application Support/EnsambleSetup/centinela"))
+CENTINELA_PS1 = CENTINELA_DIR / "centinela.ps1"
+CENTINELA_MAC_PY = CENTINELA_DIR / "centinela_mac.py"
+TAREA_DETECTAR = "EnsambleCentinelaDetectar"
+TAREA_REVISAR = "EnsambleCentinelaRevisar"
+TAREA_VIEJA = "EnsambleReaplicarAislamiento"   # versión anterior; la vigilancia la retira
+MAC_DAEMON = Path("/Library/LaunchDaemons/com.ensamble.centinela.detectar.plist")
+MAC_AGENTE = Path("/Library/LaunchAgents/com.ensamble.centinela.revisar.plist")
+SFW = "/usr/libexec/ApplicationFirewall/socketfilterfw"
+# LULU_APP, LULU_CLI y la instalación de LuLu: sección Software básico.
 
 
-def _instalar_tarea_reaplicar(exe_paths: list) -> bool:
-    REAPLICAR_DIR.mkdir(parents=True, exist_ok=True)
-    REAPLICAR_SCRIPT.write_text(_generar_ps_reaplicar(exe_paths), encoding="utf-8")
-
-    # El delete previo puede fallar si la tarea no existía todavía — esperado, no se
-    # reporta como fallo de esta función (solo importa el resultado del create).
-    run(f'schtasks /delete /tn "{REAPLICAR_TASK}" /f', check=False, capture=True)
-    return run_logged(
-        f'schtasks /create /tn "{REAPLICAR_TASK}" '
-        f'/tr "powershell -ExecutionPolicy Bypass -File \\"{REAPLICAR_SCRIPT}\\"" '
-        f'/sc daily /st 09:00 /ru SYSTEM /rl HIGHEST /f',
-        f'Crear tarea "{REAPLICAR_TASK}"',
-    )
+def _ahora() -> str:
+    return datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
 
 
-def seccion_aislar_software_profesional():
-    title("INSTALACIÓN · AISLAR SOFTWARE PROFESIONAL DE INTERNET")
+def _cj_leer(nombre, defecto):
+    ruta = CENTINELA_DIR / nombre
+    if not ruta.exists():
+        return defecto
+    try:
+        return json.loads(ruta.read_text(encoding="utf-8-sig"))
+    except Exception as e:
+        warn(f"No se pudo leer {ruta}: {e}")
+        return defecto
 
-    if not IS_WIN:
-        warn("Esta sección usa el firewall de Windows (netsh). No aplica en Mac.")
+
+def _cj_escribir(nombre, datos):
+    CENTINELA_DIR.mkdir(parents=True, exist_ok=True)
+    (CENTINELA_DIR / nombre).write_text(json.dumps(datos, indent=2, ensure_ascii=False), encoding="utf-8")
+
+
+def _sha256(ruta) -> str:
+    h = hashlib.sha256()
+    with open(ruta, "rb") as f:
+        for bloque in iter(lambda: f.read(1 << 20), b""):
+            h.update(bloque)
+    return h.hexdigest()
+
+
+def _whitelist_rutas() -> set:
+    return {str(e.get("path", "")).lower() for e in _cj_leer("whitelist.json", [])}
+
+
+def _registrar_zonas_win(carpetas):
+    zonas = _cj_leer("zonas.json", [])
+    vistas = {z.lower() for z in zonas}
+    for c in carpetas:
+        if c.lower() not in vistas:
+            zonas.append(c)
+            vistas.add(c.lower())
+    _cj_escribir("zonas.json", zonas)
+
+
+def _registrar_bloqueados_win(rutas, origen):
+    bloq = _cj_leer("bloqueados.json", [])
+    vistas = {b["path"].lower() for b in bloq}
+    for r in rutas:
+        if r.lower() not in vistas:
+            bloq.append({"path": r, "origen": origen, "fecha": _ahora()})
+            vistas.add(r.lower())
+    _cj_escribir("bloqueados.json", bloq)
+
+
+def _elegir_proveedores(pregunta: str) -> list:
+    vendor_ids = list(VENDORS.keys())
+    print(f'\n  {pregunta}')
+    for i, vid in enumerate(vendor_ids, 1):
+        print(f'    [{i}] {VENDORS[vid]["label"]}')
+    print('  Números separados por coma (ej: 2,3) o "todos":')
+    while True:
+        choice = input('\n  Tu selección: ').strip().lower()
+        if choice == 'todos':
+            return vendor_ids
+        try:
+            indices = [int(x.strip()) for x in choice.split(',') if x.strip()]
+            seleccion = [vendor_ids[i - 1] for i in indices if 1 <= i <= len(vendor_ids)]
+            if seleccion:
+                return seleccion
+        except ValueError:
+            pass
+        print('  Entrada inválida. Intenta de nuevo.')
+
+
+# ─── Windows ───
+
+def _ps_archivo(script: str):
+    """Como _run_ps_script(), pero con BOM: PowerShell 5.1 lee un .ps1 sin BOM como ANSI y
+    rompe las tildes de rutas como C:\\Users\\Andrés."""
+    tmp = Path(tempfile.gettempdir()) / f"_ensamble_centinela_{int(time.time() * 1000)}.ps1"
+    tmp.write_text(script, encoding="utf-8-sig")
+    try:
+        return subprocess.run(['powershell', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', str(tmp)],
+                              capture_output=True, text=True, encoding='utf-8', errors='replace')
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+def _centinela_preparar_win():
+    CENTINELA_DIR.mkdir(parents=True, exist_ok=True)
+    # Solo SYSTEM y Administradores escriben: un usuario estándar no puede meterse en la
+    # whitelist ni editar el script que corre como SYSTEM. SIDs y no nombres: no se traducen.
+    run_logged(['icacls', str(CENTINELA_DIR), '/inheritance:r', '/grant:r',
+                '*S-1-5-18:(OI)(CI)F', '*S-1-5-32-544:(OI)(CI)F', '*S-1-5-32-545:(OI)(CI)RX'],
+               'Restringir permisos de la carpeta del centinela')
+    CENTINELA_PS1.write_text(CENTINELA_PS1_CODIGO, encoding="utf-8-sig")
+
+
+def _centinela_ps(modo: str) -> bool:
+    _centinela_preparar_win()
+    r = subprocess.run(['powershell', '-NoProfile', '-ExecutionPolicy', 'Bypass',
+                        '-File', str(CENTINELA_PS1), '-Modo', modo])
+    return r.returncode == 0
+
+
+def _quitar_reglas_win(rutas) -> bool:
+    """Borra las reglas de entrada y salida de cada ruta. Se trae todo el prefijo y se compara
+    el nombre exacto: -DisplayName acepta comodines y '[out]' es un comodín de un carácter."""
+    if not rutas:
+        return True
+    nombres = ",".join("'" + _rule_name(r, d).replace("'", "''") + "'" for r in rutas for d in ('out', 'in'))
+    r = _ps_archivo(
+        f"$n = @({nombres})\n"
+        f"Get-NetFirewallRule -DisplayName '{REGLA_PREFIJO}*' -ErrorAction SilentlyContinue |"
+        " Where-Object { $n -contains $_.DisplayName } | Remove-NetFirewallRule -ErrorAction Stop\n")
+    if r.returncode != 0:
+        warn(f"No se pudieron quitar las reglas: {(r.stderr or r.stdout).strip()}")
+    return r.returncode == 0
+
+
+def _whitelist_agregar_win(ruta: str):
+    if not _quitar_reglas_win([ruta]):
         return
+    wl = [e for e in _cj_leer("whitelist.json", []) if e["path"].lower() != ruta.lower()]
+    wl.append({"path": ruta, "sha256": _sha256(ruta), "fecha": _ahora()})
+    _cj_escribir("whitelist.json", wl)
+    _cj_escribir("bloqueados.json", [b for b in _cj_leer("bloqueados.json", []) if b["path"].lower() != ruta.lower()])
+    ok("Agregado a la whitelist y desbloqueado.")
 
-    warn("Política de oficina: ningún programa profesional ni sus dependencias pueden")
-    warn("tener acceso a internet. Esto bloquea entrada y salida por firewall para cada")
-    warn(".exe encontrado — no desinstala ni modifica nada del programa en sí.")
 
-    dry_run = not confirm("\n¿Ejecutar en modo real? ('n' corre en modo dry-run / solo simulación)")
-    if dry_run:
-        info("[DRY-RUN] Se escaneará y reportará qué se bloquearía, sin tocar el firewall ni crear tareas.")
-
+def _aislar_win(dry_run: bool):
     apagados = _perfiles_firewall_apagados()
     if apagados:
         warn(f"\nEl firewall de Windows está apagado en: {', '.join(apagados)}.")
@@ -1666,40 +2034,33 @@ def seccion_aislar_software_profesional():
         else:
             warn("Sin el firewall activo, las reglas de bloqueo no tienen efecto. Continuando de todos modos...")
 
-    vendor_ids = list(VENDORS.keys())
-    print('\n  ¿Qué proveedores aislar de internet?')
-    for i, vid in enumerate(vendor_ids, 1):
-        print(f'    [{i}] {VENDORS[vid]["label"]}')
-    print('  Números separados por coma (ej: 2,3) o "todos":')
-
-    seleccion = []
-    while True:
-        choice = input('\n  Tu selección: ').strip().lower()
-        if choice == 'todos':
-            seleccion = vendor_ids
-            break
-        try:
-            indices = [int(x.strip()) for x in choice.split(',') if x.strip()]
-            seleccion = [vendor_ids[i - 1] for i in indices if 1 <= i <= len(vendor_ids)]
-            if seleccion:
-                break
-        except ValueError:
-            pass
-        print('  Entrada inválida. Intenta de nuevo.')
-
+    seleccion = _elegir_proveedores('¿Qué proveedores aislar de internet?')
     carpetas = _carpetas_a_bloquear(seleccion)
     info(f"\nBuscando ejecutables en {len(carpetas)} carpeta(s) conocida(s)...")
 
     # Resuelto igual que scan_vendor_win (expandvars + glob) — path_globs puede traer
     # %LOCALAPPDATA%/%APPDATA% o wildcards (ej. FLEXnet de Autodesk); sin esto, esas
     # entradas se saltaban en silencio (Path() literal nunca las encontraba).
-    encontrados = []
+    encontrados, zonas = [], []
     for carpeta in carpetas:
         for p in _resolve_win_path_glob(carpeta):
             if p.is_dir():
-                encontrados.extend(p.rglob('*.exe'))
+                zonas.append(str(p))
+                encontrados.extend(str(e) for e in p.rglob('*.exe'))
             elif p.suffix.lower() == '.exe':
-                encontrados.append(p)
+                encontrados.append(str(p))
+    encontrados = list(dict.fromkeys(encontrados))
+
+    # Los alias de WindowsApps (winget, entre otros) no son el ejecutable real: una regla sobre
+    # ellos no bloquea nada, y winget lo usan Instalación → 1 y Desinstalación de este script.
+    alias = [e for e in encontrados if '\\windowsapps\\' in e.lower()]
+    wl = _whitelist_rutas()
+    en_wl = [e for e in encontrados if e.lower() in wl]
+    encontrados = [e for e in encontrados if '\\windowsapps\\' not in e.lower() and e.lower() not in wl]
+    if alias:
+        info(f"{len(alias)} alias de WindowsApps omitido(s).")
+    if en_wl:
+        info(f"{len(en_wl)} ejecutable(s) omitido(s) por estar en la whitelist.")
 
     if not encontrados:
         ok("No se encontraron ejecutables en las carpetas de los proveedores seleccionados.")
@@ -1730,19 +2091,1471 @@ def seccion_aislar_software_profesional():
         ok("Simulación completa. Sin cambios realizados.")
         return
 
-    warn("Si el software se actualiza y agrega ejecutables nuevos o cambia de carpeta,")
-    warn("vuelve a correr esta sección para cubrir los nuevos.")
+    # Solo se registran los que quedaron con sus dos reglas: la detección restaura las que se
+    # borren y no vuelve a reportar como nuevo lo que ya está bloqueado.
+    completos = [e for e in encontrados if all(_rule_name(e, d) in existentes for d in ('out', 'in'))]
+    _registrar_bloqueados_win(completos, "proveedor")
+    _registrar_zonas_win(zonas)
+    if len(completos) < len(encontrados):
+        warn(f"{len(encontrados) - len(completos)} ejecutable(s) quedaron sin sus dos reglas (ver motivos arriba).")
+    info("Las carpetas de estos proveedores quedan como zonas aprobadas: lo nuevo que aparezca en ellas")
+    info("se bloquea provisionalmente en cada detección. Actívala en la opción 4 de este menú.")
 
-    print(f"\n{LINE}")
-    info("Como Asociado también es cuenta admin, puede desactivar el firewall o borrar")
-    info("estas reglas manualmente. Esto no lo impide, pero puede restaurarlas solo.")
-    if confirm("¿Programar reafirmación diaria (09:00, corre como SYSTEM)?"):
-        exe_paths = [str(e) for e in encontrados]
-        if _instalar_tarea_reaplicar(exe_paths):
-            ok(f"Tarea '{REAPLICAR_TASK}' creada — corre diario a las 09:00 como SYSTEM.")
-            info(f"Script: {REAPLICAR_SCRIPT}")
+
+# ─── Mac ───
+
+def _mac_helper(*args, capturar=False):
+    """Escribe el helper del centinela (siempre, para que quede al día) y lo ejecuta."""
+    CENTINELA_DIR.mkdir(parents=True, exist_ok=True)
+    os.chmod(CENTINELA_DIR, 0o755)
+    CENTINELA_MAC_PY.write_text(CENTINELA_MAC_CODIGO, encoding="utf-8")
+    os.chmod(CENTINELA_MAC_PY, 0o755)
+    cmd = [_python_mac(), str(CENTINELA_MAC_PY), *args]
+    if capturar:
+        return subprocess.run(cmd, capture_output=True, text=True)
+    return subprocess.run(cmd)
+
+
+def _python_mac() -> str:
+    """El Python que usarán launchd y el helper. /usr/bin/python3 (Command Line Tools) no cambia
+    de ruta al actualizarse; uno de Homebrew sí, y dejaría las tareas apuntando a la nada."""
+    if subprocess.run(['xcode-select', '-p'], capture_output=True).returncode == 0:
+        return '/usr/bin/python3'
+    return sys.executable
+
+
+def _mac_prerrequisitos() -> bool:
+    """Solo chequea: LuLu, lulu-cli y su extensión de red activa. La instalación y la
+    configuración manual viven en Instalación → 1 Software básico; aquí no se instala nada."""
+    faltan = [n for falta, n in ((not LULU_APP.exists(), "LuLu"), (not LULU_CLI.exists(), "lulu-cli")) if falta]
+    if not faltan and not _mac_lulu_extension_activa():
+        faltan.append("la extensión de red de LuLu activa")
+    if faltan:
+        err(f"Falta {', '.join(faltan)}.")
+        info("Instálalo en Instalación → 1 Software básico y vuelve a esta sección.")
+        return False
+    return True
+
+
+def _mac_firewall_entrante() -> bool:
+    estado = subprocess.run([SFW, '--getglobalstate'], capture_output=True, text=True).stdout.lower()
+    if 'enabled' in estado and 'disabled' not in estado:
+        return True
+    warn("El firewall de macOS (conexiones entrantes) está apagado: sin él, el bloqueo de entrada no tiene efecto.")
+    if confirm("¿Activarlo?"):
+        return run_logged([SFW, '--setglobalstate', 'on'], 'Activar firewall de macOS')
+    return False
+
+
+def _globs_mac_todos_los_usuarios(patrones) -> list:
+    """VENDORS[...]['mac'] trae rutas bajo el HOME de quien corre el script (con sudo puede ser
+    /var/root). Se replican para cada perfil de /Users."""
+    home = str(HOME)
+    usuarios = [u for u in Path('/Users').iterdir()
+                if u.is_dir() and u.name not in ('Shared', 'Guest') and not u.name.startswith('.')]
+    salida = []
+    for pat in map(str, patrones):
+        if pat.startswith(home + '/'):
+            salida.extend(str(u) + pat[len(home):] for u in usuarios)
         else:
-            err("No se pudo crear la tarea programada (ver el motivo arriba).")
+            salida.append(pat)
+    return salida
+
+
+def _aislar_mac(dry_run: bool):
+    if not _mac_prerrequisitos():
+        return
+    if not dry_run:
+        _mac_firewall_entrante()
+    seleccion = _elegir_proveedores('¿Qué proveedores aislar de internet?')
+    patrones = []
+    for vid in seleccion:
+        perfil = VENDORS[vid].get('mac', {})
+        patrones += perfil.get('app_globs', []) + perfil.get('dir_globs', [])
+    solicitud = CENTINELA_DIR / "_aislar_solicitud.json"
+    CENTINELA_DIR.mkdir(parents=True, exist_ok=True)
+    solicitud.write_text(json.dumps(_globs_mac_todos_los_usuarios(patrones)), encoding="utf-8")
+
+    info("\nBuscando ejecutables (puede tardar)...")
+    r = _mac_helper("aislar", str(solicitud), capturar=True)
+    lineas = r.stdout.splitlines()
+    total = next((int(l.split()[1]) for l in lineas if l.startswith('TOTAL ')), 0)
+    for l in lineas:
+        if not l.startswith('TOTAL '):
+            print(l)
+    if r.returncode != 0:
+        err((r.stderr or '').strip() or "El escaneo falló.")
+        return
+    if not total:
+        ok("No se encontraron ejecutables en las carpetas de los proveedores seleccionados.")
+        return
+    info(f"{total} ejecutable(s) encontrado(s).")
+    if dry_run:
+        ok("Simulación completa. Sin cambios realizados.")
+        return
+    if not confirm(f"¿Bloquear entrada y salida de internet para los {total} ejecutable(s)?"):
+        info("Cancelado.")
+        return
+    info("LuLu se recarga al final: la red queda ~8 s sin filtrar.")
+    if _mac_helper("aislar", str(solicitud), "--real").returncode == 0:
+        info("Las carpetas de estos proveedores quedan como zonas aprobadas. Activa la vigilancia en la opción 4.")
+
+
+def _uid_consola():
+    try:
+        uid = os.stat('/dev/console').st_uid
+        return uid if uid != 0 else None
+    except OSError:
+        return None
+
+
+def _vigilancia_mac():
+    import plistlib
+    if not _mac_prerrequisitos():
+        return
+    _mac_firewall_entrante()
+    info("Cortando la red de la app de LuLu para que no se actualice sola...")
+    _mac_helper("proteger-lulu")
+
+    python, log = _python_mac(), str(CENTINELA_DIR / "launchd.log")
+    daemon = {
+        'Label': 'com.ensamble.centinela.detectar',
+        'ProgramArguments': [python, str(CENTINELA_MAC_PY), 'detectar'],
+        'StartCalendarInterval': [{'Weekday': 1, 'Hour': 13, 'Minute': 30},
+                                  {'Weekday': 5, 'Hour': 13, 'Minute': 30}],
+        'StandardOutPath': log, 'StandardErrorPath': log,
+    }
+    agente = {
+        'Label': 'com.ensamble.centinela.revisar',
+        'ProgramArguments': [python, str(CENTINELA_MAC_PY), 'revisar'],
+        'RunAtLoad': True,
+        'LimitLoadToSessionType': 'Aqua',
+    }
+    for ruta, datos in ((MAC_DAEMON, daemon), (MAC_AGENTE, agente)):
+        ruta.write_bytes(plistlib.dumps(datos))
+        os.chown(ruta, 0, 0)
+        os.chmod(ruta, 0o644)
+
+    subprocess.run(['launchctl', 'bootout', 'system/com.ensamble.centinela.detectar'], capture_output=True)
+    ok_d = run_logged(['launchctl', 'bootstrap', 'system', str(MAC_DAEMON)], 'Cargar la detección (LaunchDaemon)')
+    uid = _uid_consola()
+    if uid:
+        subprocess.run(['launchctl', 'bootout', f'gui/{uid}/com.ensamble.centinela.revisar'], capture_output=True)
+        run_logged(['launchctl', 'bootstrap', f'gui/{uid}', str(MAC_AGENTE)], 'Cargar la pantalla (LaunchAgent)')
+    if ok_d:
+        ok("Vigilancia activa: lunes y viernes 13:30. La pantalla sale sola si hay algo que revisar.")
+        if confirm("¿Correr la primera detección ahora?"):
+            _mac_helper("detectar")
+
+
+def _vigilancia_win():
+    _centinela_preparar_win()
+    ps1 = str(CENTINELA_PS1).replace("'", "''")
+    r = _ps_archivo(f"""
+$ErrorActionPreference = 'Stop'
+$ps1 = '{ps1}'
+# Nombres traducidos desde el SID: 'SYSTEM' y 'Administradores' cambian con el idioma.
+$sys = (New-Object Security.Principal.SecurityIdentifier 'S-1-5-18').Translate([Security.Principal.NTAccount]).Value
+$adm = (New-Object Security.Principal.SecurityIdentifier 'S-1-5-32-544').Translate([Security.Principal.NTAccount]).Value
+$set = New-ScheduledTaskSettingsSet -StartWhenAvailable -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit (New-TimeSpan -Hours 4)
+
+$a1 = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument ('-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "' + $ps1 + '" -Modo detectar')
+$t1 = New-ScheduledTaskTrigger -Weekly -DaysOfWeek Monday,Friday -At '13:30'
+$p1 = New-ScheduledTaskPrincipal -UserId $sys -LogonType ServiceAccount -RunLevel Highest
+Register-ScheduledTask -TaskName '{TAREA_DETECTAR}' -Action $a1 -Trigger $t1 -Principal $p1 -Settings $set -Force | Out-Null
+
+# Asignada al grupo, no a una persona: corre en la sesión de cualquier administrador conectado.
+$a2 = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument ('-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "' + $ps1 + '" -Modo revisar')
+$t2 = New-ScheduledTaskTrigger -AtLogOn
+$p2 = New-ScheduledTaskPrincipal -GroupId $adm -RunLevel Highest
+Register-ScheduledTask -TaskName '{TAREA_REVISAR}' -Action $a2 -Trigger $t2 -Principal $p2 -Settings $set -Force | Out-Null
+
+Unregister-ScheduledTask -TaskName '{TAREA_VIEJA}' -Confirm:$false -ErrorAction SilentlyContinue
+'OK'
+""")
+    if r.returncode != 0 or 'OK' not in r.stdout:
+        err(f"No se pudieron crear las tareas: {(r.stderr or r.stdout).strip()}")
+        return
+    ok(f"Tareas '{TAREA_DETECTAR}' (lunes y viernes 13:30, SYSTEM) y '{TAREA_REVISAR}' creadas.")
+    info(f"La tarea anterior '{TAREA_VIEJA}' se retiró: la detección ya restaura las reglas borradas.")
+    if confirm("¿Correr la primera detección ahora? (la ventana sale al terminar si hay algo)"):
+        _ps_archivo(f"Start-ScheduledTask -TaskName '{TAREA_DETECTAR}'")
+        info("Detección en curso, en segundo plano.")
+
+
+# ─── Opciones del submenú ───
+
+def seccion_centinela_baseline():
+    title("AISLADOR + CENTINELA · CREAR BASELINE")
+    warn("El baseline es la foto de lo que se considera legítimo en este equipo. Tómalo con el")
+    warn("equipo limpio: si ya hay algo malicioso instalado, quedará registrado como normal.")
+    if IS_MAC and not _mac_prerrequisitos():
+        return
+    if _cj_leer("pendientes.json", []):
+        warn("Hay cambios pendientes de revisar. Un baseline nuevo los daría por buenos sin que nadie los vea.")
+        if not confirm("¿Crear el baseline de todos modos?"):
+            return
+    if (CENTINELA_DIR / "baseline.json").exists():
+        if not confirm("Ya existe un baseline. ¿Reemplazarlo?"):
+            return
+    elif not confirm("¿Crear el baseline ahora? Puede tardar varios minutos."):
+        return
+    exito = _centinela_ps("baseline") if IS_WIN else _mac_helper("baseline").returncode == 0
+    if exito:
+        _cj_escribir("pendientes.json", [])
+        ok("Baseline creado.")
+    else:
+        err("No se pudo crear el baseline (ver el motivo arriba).")
+
+
+def seccion_aislar_software_profesional():
+    title("AISLADOR + CENTINELA · AISLAR PROVEEDORES")
+    warn("Política de oficina: ningún programa profesional ni sus dependencias pueden")
+    warn("tener acceso a internet. Esto bloquea entrada y salida por firewall para cada")
+    warn("ejecutable encontrado — no desinstala ni modifica nada del programa en sí.")
+
+    dry_run = not confirm("\n¿Ejecutar en modo real? ('n' corre en modo dry-run / solo simulación)")
+    if dry_run:
+        info("[DRY-RUN] Se escaneará y reportará qué se bloquearía, sin tocar el firewall.")
+    if IS_WIN:
+        _aislar_win(dry_run)
+    else:
+        _aislar_mac(dry_run)
+
+
+def seccion_centinela_whitelist():
+    while True:
+        title("AISLADOR + CENTINELA · WHITELIST")
+        wl = _cj_leer("whitelist.json", [])
+        if not wl:
+            info("La whitelist está vacía.")
+        for i, e in enumerate(wl, 1):
+            print(f"  [{i}] {e['path']}   ({e.get('fecha', '')})")
+        print("\n  [a] Agregar una ruta" + ("   [q] Quitar una entrada" if wl else "") + "   [0] Volver")
+        op = ask("Opción", ["a", "0"] + (["q"] if wl else []))
+        if op == "0":
+            return
+        if op == "a":
+            ruta = input("\n  → Ruta completa del ejecutable: ").strip().strip('"')
+            if not Path(ruta).is_file():
+                err("No existe ese archivo.")
+                continue
+            if not confirm(f"¿Autorizar {ruta}? Se le quitan las reglas de bloqueo."):
+                continue
+            if IS_WIN:
+                _whitelist_agregar_win(ruta)
+            else:
+                _mac_helper("whitelist-add", ruta)
+        else:
+            n = ask("Número a quitar", [str(i) for i in range(1, len(wl) + 1)])
+            e = wl.pop(int(n) - 1)
+            _cj_escribir("whitelist.json", wl)
+            ok(f"Quitado de la whitelist: {e['path']}")
+            if Path(e['path']).exists() and confirm("¿Bloquearlo ahora?"):
+                if IS_WIN:
+                    existentes = _reglas_existentes()
+                    _bloquear_exe_firewall(e['path'], existentes)
+                    if all(_rule_name(e['path'], d) in existentes for d in ('out', 'in')):
+                        _registrar_bloqueados_win([e['path']], "centinela")
+                        ok("Bloqueado.")
+                else:
+                    _mac_helper("bloquear", e['path'])
+
+
+def seccion_centinela_vigilancia():
+    title("AISLADOR + CENTINELA · VIGILANCIA AUTOMÁTICA")
+    if not (CENTINELA_DIR / "baseline.json").exists():
+        err("Primero crea el baseline (opción 1).")
+        return
+    info("Lunes y viernes a las 13:30 (si el equipo está apagado, al encenderlo en Windows):")
+    info("  · restaura las reglas de bloqueo que alguien haya borrado;")
+    info("  · compara contra el baseline; lo nuevo dentro de una zona aprobada queda bloqueado")
+    info("    provisionalmente;")
+    info("  · si hay algo, abre sola una ventana con la lista numerada: los números que elijas")
+    info("    quedan bloqueados y lo demás pasa a la whitelist. Si la cierras sin responder,")
+    info("    vuelve a salir al iniciar sesión o el siguiente lunes o viernes.")
+    if IS_MAC:
+        info("  · en Mac además avisa si LuLu dejó de filtrar, o si cambió LuLu o macOS.")
+    if not confirm("¿Activar la vigilancia automática?"):
+        return
+    if IS_WIN:
+        _vigilancia_win()
+    else:
+        _vigilancia_mac()
+
+
+def seccion_centinela_rollback():
+    title("AISLADOR + CENTINELA · ROLLBACK")
+    warn("Quita TODAS las reglas de bloqueo del aislador y del centinela y apaga la vigilancia.")
+    info("El baseline y la whitelist se conservan.")
+    if not confirm("¿Continuar?"):
+        return
+    if IS_WIN:
+        r = _ps_archivo(
+            f"Get-NetFirewallRule -DisplayName '{REGLA_PREFIJO}*' -ErrorAction SilentlyContinue | Remove-NetFirewallRule\n"
+            f"foreach ($t in @('{TAREA_DETECTAR}', '{TAREA_REVISAR}', '{TAREA_VIEJA}')) "
+            "{ Unregister-ScheduledTask -TaskName $t -Confirm:$false -ErrorAction SilentlyContinue }\n")
+        if r.returncode != 0:
+            err(f"El rollback falló: {(r.stderr or r.stdout).strip()}")
+            return
+        for nombre in ("bloqueados.json", "zonas.json", "pendientes.json"):
+            _cj_escribir(nombre, [])
+        _cj_escribir("estado.json", {})
+    else:
+        if _mac_helper("rollback").returncode != 0:
+            err("El rollback de reglas falló (ver arriba). La vigilancia no se tocó.")
+            return
+        subprocess.run(['launchctl', 'bootout', 'system/com.ensamble.centinela.detectar'], capture_output=True)
+        uid = _uid_consola()
+        if uid:
+            subprocess.run(['launchctl', 'bootout', f'gui/{uid}/com.ensamble.centinela.revisar'], capture_output=True)
+        for ruta in (MAC_DAEMON, MAC_AGENTE):
+            ruta.unlink(missing_ok=True)
+        info("La regla que impedía que LuLu se actualice también se quitó.")
+    ok("Rollback completo.")
+
+
+def seccion_aislador_centinela():
+    _submenu("INSTALACIÓN · AISLADOR + CENTINELA", {
+        "1": ("Crear baseline (foto del equipo limpio)", seccion_centinela_baseline),
+        "2": ("Aislar proveedores de internet", seccion_aislar_software_profesional),
+        "3": ("Whitelist", seccion_centinela_whitelist),
+        "4": ("Activar vigilancia automática (lunes y viernes 13:30)", seccion_centinela_vigilancia),
+        "5": ("Rollback: quitar bloqueos y vigilancia", seccion_centinela_rollback),
+    })
+
+
+# ─── Scripts que corren las tareas programadas (se escriben a disco al usarse la sección) ───
+
+CENTINELA_PS1_CODIGO = r'''# centinela.ps1 — generado por EnsambleSetup (Instalación → Aislador + Centinela).
+# No editar a mano: se sobrescribe cada vez que se usa la sección.
+#   -Modo baseline  foto del equipo (lo llama EnsambleSetup)
+#   -Modo detectar  tarea EnsambleCentinelaDetectar, como SYSTEM, lunes y viernes 13:30
+#   -Modo revisar   tarea EnsambleCentinelaRevisar, en la sesión de un administrador
+#   -Modo pantalla  la ventana con la lista numerada (la abre 'revisar')
+param([ValidateSet('baseline', 'detectar', 'revisar', 'pantalla')][string]$Modo = 'detectar')
+
+$ErrorActionPreference = 'Continue'
+$Base = 'C:\ProgramData\EnsambleSetup\centinela'
+$Prefijo = 'EnsambleAislar:'
+$TareaRevisar = 'EnsambleCentinelaRevisar'
+# Ruido conocido que no se vigila: la plataforma de Defender cambia de carpeta en cada
+# actualización, los alias de WindowsApps no son el ejecutable real, y Package Cache y Temp
+# son instaladores de paso.
+$Excluir = '\\Windows Defender|\\WindowsApps\\|\\Package Cache\\|\\AppData\\Local\\Temp\\|\\EnsambleSetup\\'
+$Utf8 = New-Object System.Text.UTF8Encoding($false)
+
+function Ahora { Get-Date -Format s }
+
+function Log([string]$m) {
+    try { [IO.File]::AppendAllText((Join-Path $Base 'centinela.log'), ('{0} [{1}] {2}' -f (Ahora), $Modo, $m) + "`r`n", $Utf8) } catch {}
+}
+
+# El ',' evita que PowerShell desenrolle un arreglo de un elemento (o vacío) al devolverlo.
+function Leer([string]$nombre, $defecto) {
+    $p = Join-Path $Base $nombre
+    if (-not (Test-Path -LiteralPath $p)) { return ,$defecto }
+    try {
+        $t = [IO.File]::ReadAllText($p)
+        if (-not $t.Trim()) { return ,$defecto }
+        return ,(ConvertFrom-Json $t)
+    } catch { Log "No se pudo leer ${nombre}: $_"; return ,$defecto }
+}
+
+function Escribir([string]$nombre, $datos) {
+    $json = ConvertTo-Json -InputObject $datos -Depth 6
+    if ($null -eq $json) { $json = '[]' }
+    [IO.File]::WriteAllText((Join-Path $Base $nombre), $json, $Utf8)
+}
+
+function Alerta([string]$nivel, [string]$texto) { [pscustomobject]@{ nivel = $nivel; texto = $texto } }
+
+function Guardar-Estado($alertas) {
+    Escribir 'estado.json' ([pscustomobject]@{ fecha = (Ahora); alertas = @($alertas) })
+}
+
+# ─── Qué se vigila ───
+
+function Perfiles {
+    Get-ChildItem -LiteralPath 'C:\Users' -Directory -Force -ErrorAction SilentlyContinue |
+        Where-Object { @('public', 'default', 'default user', 'all users') -notcontains $_.Name.ToLower() }
+}
+
+function Carpetas-Vigiladas {
+    $c = @($env:ProgramFiles, ${env:ProgramFiles(x86)}, $env:ProgramData)
+    foreach ($u in Perfiles) {
+        $c += Join-Path $u.FullName 'AppData\Local'
+        $c += Join-Path $u.FullName 'AppData\Roaming'
+    }
+    $c | Where-Object { $_ -and (Test-Path -LiteralPath $_) } | Select-Object -Unique
+}
+
+# Hashtable ruta → FileInfo. Las claves de @{} no distinguen mayúsculas, igual que Windows.
+function Escanear-Exes {
+    $r = @{}
+    foreach ($raiz in (Carpetas-Vigiladas)) {
+        Get-ChildItem -LiteralPath $raiz -Recurse -File -Filter '*.exe' -Force -ErrorAction SilentlyContinue |
+            ForEach-Object { if ($_.FullName -notmatch $Excluir) { $r[$_.FullName] = $_ } }
+    }
+    return $r
+}
+
+function Hash([string]$p) {
+    try { return (Get-FileHash -LiteralPath $p -Algorithm SHA256 -ErrorAction Stop).Hash.ToLower() } catch { return '' }
+}
+
+function Firmado-Microsoft([string]$p) {
+    try {
+        $s = Get-AuthenticodeSignature -LiteralPath $p -ErrorAction Stop
+        return ($s.Status -eq 'Valid' -and $s.SignerCertificate.Subject -match 'O=Microsoft Corporation')
+    } catch { return $false }
+}
+
+function En-Zona([string]$p, $zonas) {
+    foreach ($z in $zonas) {
+        if ($p.StartsWith($z.TrimEnd('\') + '\', [StringComparison]::OrdinalIgnoreCase)) { return $true }
+    }
+    return $false
+}
+
+# Cada entrada es una línea de texto; si la línea cambia, es una entrada nueva.
+function Persistencia {
+    $s = New-Object System.Collections.Generic.List[string]
+    $claves = @(
+        'HKEY_LOCAL_MACHINE\Software\Microsoft\Windows\CurrentVersion\Run',
+        'HKEY_LOCAL_MACHINE\Software\Microsoft\Windows\CurrentVersion\RunOnce',
+        'HKEY_LOCAL_MACHINE\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Run',
+        'HKEY_LOCAL_MACHINE\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\RunOnce')
+    # Solo los perfiles con sesión cargada aparecen en HKEY_USERS.
+    foreach ($h in (Get-ChildItem -LiteralPath 'Registry::HKEY_USERS' -ErrorAction SilentlyContinue)) {
+        if ($h.PSChildName -match '^S-1-5-21-[\d-]+$') {
+            $claves += "HKEY_USERS\$($h.PSChildName)\Software\Microsoft\Windows\CurrentVersion\Run"
+            $claves += "HKEY_USERS\$($h.PSChildName)\Software\Microsoft\Windows\CurrentVersion\RunOnce"
+        }
+    }
+    foreach ($k in $claves) {
+        $item = Get-ItemProperty -LiteralPath "Registry::$k" -ErrorAction SilentlyContinue
+        if (-not $item) { continue }
+        foreach ($p in $item.PSObject.Properties) {
+            if ($p.Name -notmatch '^PS(Path|ParentPath|ChildName|Drive|Provider)$') { $s.Add("run|$k|$($p.Name)|$($p.Value)") }
+        }
+    }
+    foreach ($t in (Get-ScheduledTask -ErrorAction SilentlyContinue)) {
+        if ($t.TaskName -like 'Ensamble*') { continue }
+        $acc = (@($t.Actions) | ForEach-Object { ('' + $_.Execute + ' ' + $_.Arguments).Trim() }) -join ' ; '
+        # Las tareas propias de Windows cambian con cada actualización: se ignoran solo si apuntan
+        # a C:\Windows o son handlers COM. Una tarea bajo \Microsoft\ que ejecute algo de otra
+        # carpeta sí se reporta: es un disfraz clásico.
+        if ($t.TaskPath -like '\Microsoft\*' -and ($acc -eq '' -or $acc -match '^"?(%windir%|%SystemRoot%|C:\\Windows)\\')) { continue }
+        $s.Add("tarea|$($t.TaskPath)$($t.TaskName)|$acc")
+    }
+    foreach ($sv in (Get-CimInstance Win32_Service -ErrorAction SilentlyContinue)) {
+        $pn = '' + $sv.PathName
+        if ($pn -match '^"?(%SystemRoot%|%windir%|C:\\Windows)\\') { continue }
+        $s.Add("servicio|$($sv.Name)|$pn")
+    }
+    $inicio = @('C:\ProgramData\Microsoft\Windows\Start Menu\Programs\StartUp')
+    foreach ($u in Perfiles) { $inicio += Join-Path $u.FullName 'AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Startup' }
+    foreach ($d in $inicio) {
+        Get-ChildItem -LiteralPath $d -File -Force -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -ne 'desktop.ini' } | ForEach-Object { $s.Add("inicio|$($_.FullName)") }
+    }
+    return ,[string[]]@($s | Where-Object { $_ -notmatch $Excluir })
+}
+
+function Exe-De([string]$firma) {
+    $t = [Environment]::ExpandEnvironmentVariables($firma)
+    if ($t -match '([A-Za-z]:\\[^"|*?<>]*?\.exe)') { return $Matches[1] }
+    return ''
+}
+
+# ─── Baseline: ejecutables en TSV (ConvertFrom-Json de PowerShell 5.1 es lento con miles de
+# ─── objetos), persistencia en baseline.json
+
+function Cargar-BaseExes {
+    $r = @{}
+    $f = Join-Path $Base 'baseline_exes.tsv'
+    if (Test-Path -LiteralPath $f) {
+        foreach ($l in [IO.File]::ReadAllLines($f)) {
+            $c = $l.Split("`t")
+            if ($c.Count -eq 4) { $r[$c[0]] = [pscustomobject]@{ h = $c[1]; s = [int64]$c[2]; m = [int64]$c[3] } }
+        }
+    }
+    return $r
+}
+
+function Guardar-BaseExes($r) {
+    $lineas = foreach ($k in $r.Keys) { $v = $r[$k]; "$k`t$($v.h)`t$($v.s)`t$($v.m)" }
+    [IO.File]::WriteAllLines((Join-Path $Base 'baseline_exes.tsv'), [string[]]@($lineas), $Utf8)
+}
+
+# ─── Firewall ───
+# Get-NetFirewallRule -DisplayName acepta comodines, y '[out]' es un comodín de UN carácter:
+# buscar el nombre exacto nunca encuentra la regla. Por eso se trae todo el prefijo y se compara.
+
+function Reglas-Existentes {
+    $h = @{}
+    Get-NetFirewallRule -DisplayName "$Prefijo*" -ErrorAction SilentlyContinue | ForEach-Object { $h[$_.DisplayName] = $true }
+    return $h
+}
+
+function Nombre-Regla([string]$p, [string]$dir) { "$Prefijo $p [$dir]" }
+
+# Crea las reglas que falten. Devuelve cuántas creó, o -1 si alguna falló.
+function Bloquear([string]$p, $existentes) {
+    $creadas = 0
+    foreach ($d in 'out', 'in') {
+        $n = Nombre-Regla $p $d
+        if ($existentes.ContainsKey($n)) { continue }
+        $dir = if ($d -eq 'out') { 'Outbound' } else { 'Inbound' }
+        try {
+            New-NetFirewallRule -DisplayName $n -Direction $dir -Program $p -Action Block -Profile Any -ErrorAction Stop | Out-Null
+            $existentes[$n] = $true
+            $creadas++
+        } catch { Log "No se pudo crear '$n': $_"; return -1 }
+    }
+    return $creadas
+}
+
+function Desbloquear($rutas) {
+    $nombres = @{}
+    foreach ($p in $rutas) { $nombres[(Nombre-Regla $p 'out')] = $true; $nombres[(Nombre-Regla $p 'in')] = $true }
+    Get-NetFirewallRule -DisplayName "$Prefijo*" -ErrorAction SilentlyContinue |
+        Where-Object { $nombres.ContainsKey($_.DisplayName) } | Remove-NetFirewallRule -ErrorAction SilentlyContinue
+}
+
+function Quitar-De($lista, [string]$p) {
+    for ($j = $lista.Count - 1; $j -ge 0; $j--) { if ($lista[$j].path -eq $p) { $lista.RemoveAt($j) } }
+}
+
+# ─── Modos ───
+
+function Modo-Baseline {
+    Write-Host '  Buscando ejecutables en las carpetas vigiladas...'
+    $exes = Escanear-Exes
+    $total = $exes.Count
+    $i = 0
+    $r = @{}
+    foreach ($f in $exes.Values) {
+        $i++
+        if ($i % 250 -eq 0) { Write-Host ('  {0}/{1} ejecutables con hash...' -f $i, $total) }
+        $r[$f.FullName] = [pscustomobject]@{ h = (Hash $f.FullName); s = $f.Length; m = $f.LastWriteTimeUtc.Ticks }
+    }
+    Guardar-BaseExes $r
+    Write-Host '  Registrando persistencia (inicio automático, tareas, servicios)...'
+    $pers = @(Persistencia)
+    Escribir 'baseline.json' ([pscustomobject]@{ creado = (Ahora); equipo = $env:COMPUTERNAME; exes = $total; persistencia = $pers })
+    Log "Baseline: $total ejecutables, $($pers.Count) entradas de persistencia."
+    Write-Host ('  {0} ejecutables y {1} entradas de persistencia registrados.' -f $total, $pers.Count)
+}
+
+function Modo-Detectar {
+    $alertas = New-Object System.Collections.Generic.List[object]
+
+    $apagados = @(Get-NetFirewallProfile -ErrorAction SilentlyContinue | Where-Object { -not $_.Enabled } | ForEach-Object { $_.Name })
+    if ($apagados.Count) {
+        $alertas.Add((Alerta 'grave' "El firewall de Windows está apagado en: $($apagados -join ', '). Mientras siga así, ningún bloqueo tiene efecto."))
+    }
+
+    # Reafirmación: lo que ya estaba bloqueado y alguien desbloqueó a mano vuelve a bloquearse.
+    $existentes = Reglas-Existentes
+    $bloq = @(Leer 'bloqueados.json' @())
+    $bloqSet = @{}
+    $restauradas = 0
+    $fallidas = 0
+    foreach ($b in $bloq) {
+        $bloqSet[$b.path] = $true
+        if (Test-Path -LiteralPath $b.path) {
+            $n = Bloquear $b.path $existentes
+            if ($n -gt 0) { $restauradas += $n } elseif ($n -lt 0) { $fallidas++ }
+        }
+    }
+    if ($restauradas) { $alertas.Add((Alerta 'info' "Se restauraron $restauradas regla(s) de bloqueo que alguien había borrado.")) }
+    if ($fallidas) { $alertas.Add((Alerta 'grave' "No se pudieron recrear las reglas de $fallidas ejecutable(s) bloqueado(s). Revisa $Base\centinela.log.")) }
+
+    if (-not (Test-Path -LiteralPath (Join-Path $Base 'baseline_exes.tsv'))) {
+        $alertas.Add((Alerta 'grave' 'No hay baseline: la detección de cambios no corre. Créalo en EnsambleSetup → Instalación → Aislador + Centinela.'))
+        Guardar-Estado $alertas
+        Start-ScheduledTask -TaskName $TareaRevisar -ErrorAction SilentlyContinue
+        return
+    }
+
+    $bl = Leer 'baseline.json' $null
+    $base = Cargar-BaseExes
+    $wl = @{}
+    foreach ($w in @(Leer 'whitelist.json' @())) { $wl[$w.path] = $true }
+    $zonas = @(Leer 'zonas.json' @())
+    $pend = New-Object System.Collections.Generic.List[object]
+    foreach ($x in @(Leer 'pendientes.json' @())) { $pend.Add($x) }
+    $ids = @{}
+    foreach ($x in $pend) { $ids[$x.id] = $true }
+    $nuevosBloq = New-Object System.Collections.Generic.List[object]
+    $nuevos = 0
+
+    foreach ($f in (Escanear-Exes).Values) {
+        $p = $f.FullName
+        if ($bloqSet.ContainsKey($p)) { continue }   # ya bloqueado: que cambie no importa
+        $b = $base[$p]
+        $tipo = $null
+        $h = ''
+        if ($null -eq $b) {
+            if ($wl.ContainsKey($p)) { continue }
+            $tipo = 'NUEVO'
+        } elseif ($b.s -ne $f.Length -or $b.m -ne $f.LastWriteTimeUtc.Ticks) {
+            $h = Hash $p
+            if ($h -and $h -ne $b.h) { $tipo = 'MODIFICADO' }
+        }
+        if (-not $tipo) { continue }
+        $id = "$tipo|$p"
+        if ($ids.ContainsKey($id)) { continue }
+        $enZona = En-Zona $p $zonas
+        # Fuera de zona, lo firmado por Microsoft es Windows actualizándose: no se reporta.
+        # Dentro de zona sí (Office es de Microsoft y está en la política de aislamiento).
+        if (-not $enZona -and (Firmado-Microsoft $p)) { continue }
+        if (-not $h) { $h = Hash $p }
+        $prov = $false
+        if ($enZona -and -not $wl.ContainsKey($p)) {
+            if ((Bloquear $p $existentes) -ge 0) {
+                $prov = $true
+                $bloqSet[$p] = $true
+                $nuevosBloq.Add([pscustomobject]@{ path = $p; origen = 'provisional'; fecha = (Ahora) })
+            }
+        }
+        $pend.Add([pscustomobject]@{ id = $id; tipo = $tipo; path = $p; detalle = ''; sha256 = $h; en_zona = $enZona; provisional = $prov; fecha = (Ahora) })
+        $ids[$id] = $true
+        $nuevos++
+    }
+
+    $basePers = @{}
+    if ($bl) { foreach ($x in @($bl.persistencia)) { if ($x) { $basePers[$x] = $true } } }
+    foreach ($x in @(Persistencia)) {
+        if ($basePers.ContainsKey($x)) { continue }
+        $id = "PERSISTENCIA|$x"
+        if ($ids.ContainsKey($id)) { continue }
+        $pend.Add([pscustomobject]@{ id = $id; tipo = 'PERSISTENCIA'; path = (Exe-De $x); detalle = $x; sha256 = ''; en_zona = $false; provisional = $false; fecha = (Ahora) })
+        $ids[$id] = $true
+        $nuevos++
+    }
+
+    if ($nuevosBloq.Count) { Escribir 'bloqueados.json' (@($bloq) + @($nuevosBloq)) }
+    Escribir 'pendientes.json' $pend
+    Guardar-Estado $alertas
+    Log "Detección: $nuevos nuevo(s), $($nuevosBloq.Count) bloqueado(s) provisionalmente, $($pend.Count) pendiente(s) en total."
+    if ($pend.Count -or $alertas.Count) { Start-ScheduledTask -TaskName $TareaRevisar -ErrorAction SilentlyContinue }
+}
+
+# Corre oculto: si hay algo que mostrar abre la ventana; si no, termina sin que se note.
+function Modo-Revisar {
+    $pend = @(Leer 'pendientes.json' @())
+    $est = Leer 'estado.json' $null
+    $alertas = @()
+    if ($est) { $alertas = @($est.alertas | Where-Object { $_ }) }
+    if (-not $pend.Count -and -not $alertas.Count) { return }
+    Start-Process -FilePath 'powershell.exe' -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$PSCommandPath`"", '-Modo', 'pantalla')
+}
+
+function Aplicar($pend, $elegidos) {
+    $existentes = Reglas-Existentes
+    $bloq = New-Object System.Collections.Generic.List[object]
+    foreach ($b in @(Leer 'bloqueados.json' @())) { $bloq.Add($b) }
+    $wl = New-Object System.Collections.Generic.List[object]
+    foreach ($w in @(Leer 'whitelist.json' @())) { $wl.Add($w) }
+    $bl = Leer 'baseline.json' $null
+    $pers = New-Object System.Collections.Generic.List[string]
+    if ($bl) { foreach ($x in @($bl.persistencia)) { if ($x) { $pers.Add($x) } } }
+    $base = Cargar-BaseExes
+    $desbloquear = New-Object System.Collections.Generic.List[string]
+    $mostrados = @{}
+
+    for ($i = 0; $i -lt $pend.Count; $i++) {
+        $x = $pend[$i]
+        $p = '' + $x.path
+        $mostrados[$x.id] = $true
+        if ($elegidos.ContainsKey($i)) {
+            if ($p -and (Test-Path -LiteralPath $p)) {
+                if ((Bloquear $p $existentes) -lt 0) { Write-Host "  No se pudo bloquear $p (ver centinela.log)" -ForegroundColor Red }
+                Quitar-De $wl $p
+                Quitar-De $bloq $p
+                $bloq.Add([pscustomobject]@{ path = $p; origen = 'centinela'; fecha = (Ahora) })
+            }
+        } elseif ($p -and $x.tipo -ne 'PERSISTENCIA') {
+            if ($x.provisional) { $desbloquear.Add($p) }
+            Quitar-De $bloq $p
+            Quitar-De $wl $p
+            $wl.Add([pscustomobject]@{ path = $p; sha256 = $x.sha256; fecha = (Ahora) })
+        }
+        if ($x.tipo -eq 'PERSISTENCIA') {
+            $pers.Add($x.detalle)
+        } elseif ($p -and (Test-Path -LiteralPath $p)) {
+            $f = Get-Item -LiteralPath $p -Force
+            $h = if ($x.sha256) { $x.sha256 } else { Hash $p }
+            $base[$p] = [pscustomobject]@{ h = $h; s = $f.Length; m = $f.LastWriteTimeUtc.Ticks }
+        }
+    }
+    if ($desbloquear.Count) { Desbloquear $desbloquear }
+
+    Escribir 'bloqueados.json' $bloq
+    Escribir 'whitelist.json' $wl
+    Guardar-BaseExes $base
+    if ($bl) { $bl.persistencia = [string[]]$pers.ToArray(); Escribir 'baseline.json' $bl }
+    # Si la detección corrió mientras la ventana estaba abierta, lo que agregó se conserva.
+    $restantes = @(@(Leer 'pendientes.json' @()) | Where-Object { -not $mostrados.ContainsKey($_.id) })
+    Escribir 'pendientes.json' $restantes
+    Log ('Revisión: {0} bloqueado(s), {1} a whitelist.' -f $elegidos.Count, ($pend.Count - $elegidos.Count))
+}
+
+function Modo-Pantalla {
+    $mutex = New-Object System.Threading.Mutex($false, 'Global\EnsambleCentinelaPantalla')
+    if (-not $mutex.WaitOne(0)) { return }   # ya hay una ventana abierta
+    try {
+        $Host.UI.RawUI.WindowTitle = 'Ensamble · Centinela'
+        Write-Host ''
+        Write-Host '  ══════════════════════════════════════════════════════' -ForegroundColor Cyan
+        Write-Host '   CENTINELA · Cambios en este equipo desde el baseline' -ForegroundColor Cyan
+        Write-Host '  ══════════════════════════════════════════════════════' -ForegroundColor Cyan
+
+        $est = Leer 'estado.json' $null
+        $alertas = @()
+        if ($est) { $alertas = @($est.alertas | Where-Object { $_ }) }
+        foreach ($a in $alertas) {
+            $color = if ($a.nivel -eq 'grave') { 'Red' } else { 'Yellow' }
+            Write-Host ''
+            Write-Host "  ⚠  $($a.texto)" -ForegroundColor $color
+        }
+        # Los avisos informativos se muestran una vez; los graves siguen hasta que se corrijan.
+        if ($alertas.Count) {
+            Escribir 'estado.json' ([pscustomobject]@{ fecha = $est.fecha; alertas = @($alertas | Where-Object { $_.nivel -eq 'grave' }) })
+        }
+
+        $pend = @(Leer 'pendientes.json' @())
+        if (-not $pend.Count) {
+            Write-Host ''
+            Read-Host '  Presiona Enter para cerrar' | Out-Null
+            return
+        }
+
+        Write-Host ''
+        Write-Host "  Aparecieron $($pend.Count) cambio(s):"
+        Write-Host ''
+        for ($i = 0; $i -lt $pend.Count; $i++) {
+            $x = $pend[$i]
+            $marca = if ($x.provisional) { '  [bloqueado provisionalmente]' } elseif ($x.en_zona) { '  [zona aprobada]' } else { '' }
+            $ruta = if ($x.path) { $x.path } else { '(sin ejecutable identificable: solo aviso)' }
+            Write-Host ('  [{0,2}] {1,-12} {2}{3}' -f ($i + 1), $x.tipo, $ruta, $marca)
+            if ($x.tipo -eq 'PERSISTENCIA') { Write-Host ('        {0}' -f $x.detalle) -ForegroundColor DarkGray }
+        }
+        Write-Host ''
+        Write-Host '  Escribe los números que quedan BLOQUEADOS (ej: 1,3,4).'
+        Write-Host '  Lo que no elijas pasa a la whitelist y recupera la red.'
+        Write-Host "  'ninguno': no se bloquea nada.   Enter vacío: decidir después."
+
+        while ($true) {
+            $r = ('' + (Read-Host '  →')).Trim().ToLower()
+            if (-not $r) {
+                Write-Host '  Queda pendiente. La ventana vuelve a salir al iniciar sesión o el próximo lunes o viernes.'
+                Start-Sleep -Seconds 4
+                return
+            }
+            $elegidos = @{}
+            $valido = $true
+            if ($r -ne 'ninguno') {
+                foreach ($t in $r.Split(',')) {
+                    $n = 0
+                    if ([int]::TryParse($t.Trim(), [ref]$n) -and $n -ge 1 -and $n -le $pend.Count) { $elegidos[$n - 1] = $true } else { $valido = $false }
+                }
+            }
+            if (-not $valido) {
+                Write-Host "  Entrada inválida: números de la lista separados por coma, o 'ninguno'." -ForegroundColor Yellow
+                continue
+            }
+            $c = Read-Host ('  Se bloquean {0}; pasan a whitelist {1}. ¿Confirmas? [s/n]' -f $elegidos.Count, ($pend.Count - $elegidos.Count))
+            if (('' + $c).Trim().ToLower() -eq 's') { break }
+            Write-Host '  Escribe de nuevo los números, o Enter vacío para decidir después.'
+        }
+
+        Aplicar $pend $elegidos
+        Write-Host ''
+        Write-Host '  Listo.' -ForegroundColor Green
+        Start-Sleep -Seconds 3
+    } finally {
+        $mutex.ReleaseMutex()
+        $mutex.Dispose()
+    }
+}
+
+if (-not (Test-Path -LiteralPath $Base)) { New-Item -ItemType Directory -Path $Base -Force | Out-Null }
+switch ($Modo) {
+    'baseline' { Modo-Baseline }
+    'detectar' { Modo-Detectar }
+    'revisar' { Modo-Revisar }
+    'pantalla' { Modo-Pantalla }
+}
+'''
+
+CENTINELA_MAC_CODIGO = r'''#!/usr/bin/env python3
+"""Centinela para macOS, generado por EnsambleSetup (Instalación → Aislador + Centinela).
+No editar a mano: se sobrescribe cada vez que se usa la sección.
+
+Salida a la red: LuLu, vía lulu-cli. Entrada: firewall de aplicaciones de macOS (socketfilterfw).
+Compatible con Python 3.9 (el de las Command Line Tools de Apple).
+
+  baseline                       foto del equipo (root)
+  aislar <patrones.json> [--real]  bloquea los ejecutables de las carpetas de proveedores (root)
+  detectar                       LaunchDaemon, lunes y viernes 13:30 (root)
+  revisar                        LaunchAgent, en la sesión del usuario: muestra la lista
+  aplicar <huella> <números>     lo llama 'revisar' con contraseña de administrador (root)
+  bloquear <ruta> | whitelist-add <ruta> | proteger-lulu | rollback   (root)
+"""
+
+import fcntl
+import glob
+import hashlib
+import json
+import os
+import plistlib
+import shlex
+import struct
+import subprocess
+import sys
+import time
+from datetime import datetime
+from pathlib import Path
+
+BASE = Path('/Library/Application Support/EnsambleSetup/centinela')
+LULU_CLI = '/usr/local/bin/lulu-cli'
+LULU_APP = '/Applications/LuLu.app'
+LULU_EXE = LULU_APP + '/Contents/MacOS/LuLu'
+SFW = '/usr/libexec/ApplicationFirewall/socketfilterfw'
+LABEL_AGENTE = 'com.ensamble.centinela.revisar'
+TITULO = 'Centinela · Ensamble'
+# LuLu no se vigila como ejecutable nuevo: su cambio de versión lo reporta salud().
+EXCLUIR = (str(BASE), '/Library/Application Support/Apple/', LULU_APP + '/')
+
+
+def ahora():
+    return datetime.now().strftime('%Y-%m-%dT%H:%M:%S')
+
+
+def log(m):
+    try:
+        with open(BASE / 'centinela.log', 'a', encoding='utf-8') as f:
+            f.write(f'{ahora()} {m}\n')
+    except OSError:
+        pass
+
+
+def leer(nombre, defecto):
+    p = BASE / nombre
+    try:
+        return json.loads(p.read_text(encoding='utf-8')) if p.exists() else defecto
+    except Exception as e:
+        log(f'No se pudo leer {nombre}: {e}')
+        return defecto
+
+
+def escribir(nombre, datos):
+    BASE.mkdir(parents=True, exist_ok=True)
+    tmp = BASE / (nombre + '.tmp')
+    tmp.write_text(json.dumps(datos, indent=2, ensure_ascii=False), encoding='utf-8')
+    os.chmod(tmp, 0o644)   # 'revisar' corre como usuario y necesita leer
+    tmp.replace(BASE / nombre)
+
+
+def sha256(p):
+    h = hashlib.sha256()
+    try:
+        with open(p, 'rb') as f:
+            for bloque in iter(lambda: f.read(1 << 20), b''):
+                h.update(bloque)
+        return h.hexdigest()
+    except OSError:
+        return ''
+
+
+def alerta(nivel, texto):
+    return {'nivel': nivel, 'texto': texto}
+
+
+def guardar_estado(alertas):
+    escribir('estado.json', {'fecha': ahora(), 'alertas': alertas})
+
+
+def usuarios():
+    try:
+        return [u for u in Path('/Users').iterdir()
+                if u.is_dir() and u.name not in ('Shared', 'Guest') and not u.name.startswith('.')]
+    except OSError:
+        return []
+
+
+def vigiladas():
+    c = ['/Applications', '/Library/Application Support', '/Library/PrivilegedHelperTools']
+    for u in usuarios():
+        c += [str(u / 'Applications'), str(u / 'Library/Application Support')]
+    return [x for x in c if os.path.isdir(x)]
+
+
+def en_zona(p, zonas):
+    return any(p == z or p.startswith(z.rstrip('/') + '/') for z in zonas)
+
+
+# ─── Ejecutables Mach-O ───
+
+_THIN = {b'\xfe\xed\xfa\xce': '>', b'\xce\xfa\xed\xfe': '<', b'\xfe\xed\xfa\xcf': '>', b'\xcf\xfa\xed\xfe': '<'}
+MH_EXECUTE = 2
+
+
+def _tipo_thin(cab):
+    end = _THIN.get(cab[:4])
+    return struct.unpack(end + 'I', cab[12:16])[0] if end and len(cab) >= 16 else None
+
+
+def es_ejecutable(p):
+    """Mach-O de tipo MH_EXECUTE con bit de ejecución. Deja fuera dylibs, plugins y scripts:
+    a una librería no se le puede poner una regla de firewall, se le pone al proceso que la carga."""
+    try:
+        st = os.lstat(p)
+        if (st.st_mode & 0o170000) != 0o100000 or not (st.st_mode & 0o111):
+            return False
+        with open(p, 'rb') as f:
+            cab = f.read(32)
+            t = _tipo_thin(cab)
+            if t is not None:
+                return t == MH_EXECUTE
+            if cab[:4] in (b'\xca\xfe\xba\xbe', b'\xca\xfe\xba\xbf') and len(cab) >= 24:
+                n = struct.unpack('>I', cab[4:8])[0]
+                if not 0 < n < 20:   # 0xcafebabe también es la firma de un .class de Java
+                    return False
+                off = struct.unpack('>I', cab[16:20])[0] if cab[3] == 0xbe else struct.unpack('>Q', cab[16:24])[0]
+                f.seek(off)
+                return _tipo_thin(f.read(16)) == MH_EXECUTE
+    except (OSError, struct.error):
+        pass
+    return False
+
+
+def escanear(raices):
+    r = {}
+    for raiz in raices:
+        if os.path.isfile(raiz):
+            if es_ejecutable(raiz):
+                r[raiz] = os.stat(raiz)
+            continue
+        for d, subdirs, archivos in os.walk(raiz, onerror=lambda e: None):
+            if d.startswith(EXCLUIR):
+                subdirs[:] = []
+                continue
+            for a in archivos:
+                p = os.path.join(d, a)
+                if es_ejecutable(p):
+                    r[p] = os.lstat(p)
+    return r
+
+
+def firma(p):
+    """(tipo, clave de LuLu). Replica Process.generateKey de LuLu 4.5.1: firma de Apple o de la
+    App Store → id de firma; Developer ID → 'id:autoridad hoja'; sin firma válida → la ruta."""
+    r = subprocess.run(['codesign', '-dvv', p], capture_output=True, text=True)
+    ident, auths = None, []
+    for linea in r.stderr.splitlines():
+        if linea.startswith('Identifier='):
+            ident = linea.split('=', 1)[1].strip()
+        elif linea.startswith('Authority='):
+            auths.append(linea.split('=', 1)[1].strip())
+    if r.returncode != 0 or not ident or not auths:
+        return 'ninguna', p
+    if auths[0] == 'Software Signing':
+        return 'apple', ident
+    if auths[0] == 'Apple Mac OS Application Signing':
+        return 'appstore', ident
+    if auths[0].startswith('Developer ID Application:'):
+        return 'devid', f'{ident}:{auths[0]}'
+    return 'otra', p
+
+
+def persistencia():
+    s = []
+    dirs = ['/Library/LaunchAgents', '/Library/LaunchDaemons'] + [str(u / 'Library/LaunchAgents') for u in usuarios()]
+    for d in dirs:
+        try:
+            nombres = sorted(os.listdir(d))
+        except OSError:
+            continue
+        for n in nombres:
+            if n.endswith('.plist') and not n.startswith('com.ensamble.centinela'):
+                p = os.path.join(d, n)
+                s.append(f'plist|{p}|{sha256(p)}')
+    return s
+
+
+def exe_de_plist(firma_txt):
+    try:
+        with open(firma_txt.split('|')[1], 'rb') as f:
+            d = plistlib.load(f)
+        prog = d.get('Program') or (d.get('ProgramArguments') or [''])[0]
+        return prog if prog and os.path.isfile(prog) else ''
+    except Exception:
+        return ''
+
+
+# ─── LuLu + socketfilterfw ───
+
+def lulu(*args):
+    return subprocess.run([LULU_CLI, *args], capture_output=True, text=True)
+
+
+def claves_bloqueadas():
+    """Claves con una regla 'Block * *' en LuLu, o None si lulu-cli no pudo leer las reglas."""
+    if not os.path.isfile(LULU_CLI):
+        return None
+    r = lulu('list')
+    if r.returncode != 0:
+        return None
+    s, actual = set(), None
+    for linea in r.stdout.splitlines():
+        if linea.startswith('[') and linea.endswith(']'):
+            actual = linea[1:-1]
+        elif actual and '| Block |' in linea and 'addr=* port=*' in linea:
+            s.add(actual)
+    return s
+
+
+def bloquear(rutas, origen, existentes):
+    """Bloquea salida (LuLu) y entrada (socketfilterfw). No recarga LuLu: quien llama hace un
+    solo reload al final, porque cada reload deja la red ~8 s sin filtrar.
+
+    Con firma válida se crean DOS reglas en LuLu, por id de firma y por ruta: si la firma
+    dejara de validar (binario alterado), LuLu pasa a identificar el proceso por su ruta."""
+    hechos = []
+    for p in rutas:
+        _, clave = firma(p)
+        claves = [clave] if clave == p else [clave, p]
+        todo_ok = True
+        for k in claves:
+            if k in existentes:
+                continue
+            if lulu('add', '--key', k, '--path', p, '--action', 'block', '--addr', '*', '--port', '*').returncode == 0:
+                existentes.add(k)
+            else:
+                todo_ok = False
+                log(f'lulu-cli add falló para {k}')
+        subprocess.run([SFW, '--add', p], capture_output=True)
+        subprocess.run([SFW, '--blockapp', p], capture_output=True)
+        if todo_ok:
+            hechos.append({'path': p, 'claves': claves, 'origen': origen, 'fecha': ahora()})
+    return hechos
+
+
+def desbloquear(items, restantes):
+    """Quita los bloqueos de items. Una clave de LuLu que otro bloqueado siga usando (dos
+    ejecutables con el mismo id de firma) no se toca."""
+    en_uso = {k for b in restantes for k in b.get('claves', [])}
+    for b in items:
+        for k in b.get('claves', []):
+            if k not in en_uso:
+                lulu('delete-match', '--key', k, '--action', 'block', '--addr', '*', '--port', '*')
+        subprocess.run([SFW, '--unblockapp', b['path']], capture_output=True)
+        subprocess.run([SFW, '--remove', b['path']], capture_output=True)
+
+
+def recargar():
+    ok = lulu('reload').returncode == 0
+    time.sleep(10)   # macOS reinicia la extensión en ~8 s
+    return ok
+
+
+def fusionar(bloq, hechos):
+    rutas = {h['path'] for h in hechos}
+    return [b for b in bloq if b['path'] not in rutas] + hechos
+
+
+# ─── Salud de LuLu (decisión 2026-09-28: si LuLu se cae, se avisa; no se intenta arreglar) ───
+
+def extension_activa():
+    r = subprocess.run(['systemextensionsctl', 'list'], capture_output=True, text=True)
+    return any('com.objective-see.lulu' in l and '[activated enabled]' in l for l in r.stdout.splitlines())
+
+
+def version_app(app):
+    try:
+        with open(os.path.join(app, 'Contents/Info.plist'), 'rb') as f:
+            return plistlib.load(f).get('CFBundleShortVersionString', '')
+    except Exception:
+        return ''
+
+
+def version_macos():
+    return subprocess.run(['sw_vers', '-productVersion'], capture_output=True, text=True).stdout.strip()
+
+
+def registrar_versiones():
+    escribir('versiones.json', {'lulu': version_app(LULU_APP), 'macos': version_macos()})
+
+
+def salud(alertas):
+    if not os.path.isdir(LULU_APP):
+        alertas.append(alerta('grave', 'LuLu no está instalado: la salida a internet de este Mac no se está filtrando.'))
+        return
+    if not extension_activa():
+        alertas.append(alerta('grave', 'La extensión de red de LuLu no está activa: LuLu no está filtrando nada. '
+                                       'Suele pasar después de actualizar macOS.'))
+    fw = subprocess.run([SFW, '--getglobalstate'], capture_output=True, text=True).stdout.lower()
+    if 'disabled' in fw or 'enabled' not in fw:
+        alertas.append(alerta('grave', 'El firewall de macOS está apagado: los bloqueos de conexiones entrantes no tienen efecto.'))
+
+    reg = leer('versiones.json', {})
+    v_lulu, v_mac = version_app(LULU_APP), version_macos()
+    if reg.get('lulu') and reg['lulu'] != v_lulu:
+        alertas.append(alerta('grave', f"LuLu cambió de versión ({reg['lulu']} → {v_lulu}). lulu-cli escribe el archivo "
+                                       'interno de reglas de LuLu: verifica que siga funcionando.'))
+    if reg.get('macos') and reg['macos'] != v_mac:
+        alertas.append(alerta('grave', f"macOS cambió de versión ({reg['macos']} → {v_mac}). Verifica que LuLu siga filtrando."))
+    registrar_versiones()
+
+    existentes = claves_bloqueadas()
+    if existentes is None:
+        alertas.append(alerta('grave', 'lulu-cli no pudo leer las reglas de LuLu (¿falta, o cambió el formato con una '
+                                       'actualización?). No se pueden crear ni restaurar bloqueos.'))
+        return
+    bloq = leer('bloqueados.json', [])
+    faltan = [b for b in bloq if os.path.exists(b['path']) and any(k not in existentes for k in b.get('claves', []))]
+    if faltan:
+        bloquear([b['path'] for b in faltan], None, existentes)
+        recargar()
+        aun = claves_bloqueadas() or set()
+        perdidas = [b for b in faltan if any(k not in aun for k in b.get('claves', []))]
+        if perdidas:
+            alertas.append(alerta('grave', f'No se pudieron restaurar las reglas de {len(perdidas)} ejecutable(s) en LuLu.'))
+        else:
+            alertas.append(alerta('info', f'Se restauraron las reglas de {len(faltan)} ejecutable(s) que ya no estaban en LuLu.'))
+
+
+# ─── Comandos (root) ───
+
+def cmd_baseline():
+    print('  Buscando ejecutables en las carpetas vigiladas...')
+    exes = escanear(vigiladas())
+    datos = {}
+    for i, (p, st) in enumerate(exes.items(), 1):
+        if i % 250 == 0:
+            print(f'  {i}/{len(exes)} ejecutables con hash...')
+        datos[p] = {'h': sha256(p), 's': st.st_size, 'm': int(st.st_mtime)}
+    print('  Registrando persistencia (LaunchAgents y LaunchDaemons)...')
+    pers = persistencia()
+    escribir('baseline_exes.json', datos)
+    escribir('baseline.json', {'creado': ahora(), 'equipo': os.uname().nodename, 'exes': len(datos), 'persistencia': pers})
+    log(f'Baseline: {len(datos)} ejecutables, {len(pers)} entradas de persistencia.')
+    print(f'  {len(datos)} ejecutables y {len(pers)} entradas de persistencia registrados.')
+
+
+def cmd_aislar(archivo, real):
+    patrones = json.loads(Path(archivo).read_text(encoding='utf-8'))
+    raices = sorted({p for pat in patrones for p in glob.glob(pat)})
+    wl = {w['path'] for w in leer('whitelist.json', [])}
+    exes = sorted(p for p in escanear(raices) if p not in wl)
+    if not real:
+        ya = {b['path'] for b in leer('bloqueados.json', [])}
+        for p in exes:
+            print(f'  Se bloquearía: {p}' + ('   (ya tenía regla)' if p in ya else ''))
+        print(f'TOTAL {len(exes)}')
+        return
+    existentes = claves_bloqueadas()
+    if existentes is None:
+        sys.exit('  lulu-cli no pudo leer las reglas de LuLu. No se bloqueó nada.')
+    print(f'  Bloqueando {len(exes)} ejecutable(s)...')
+    hechos = bloquear(exes, 'proveedor', existentes)
+    escribir('bloqueados.json', fusionar(leer('bloqueados.json', []), hechos))
+    zonas = leer('zonas.json', [])
+    escribir('zonas.json', sorted(set(zonas) | {r for r in raices if os.path.isdir(r)}))
+    recargar()
+    print(f'  {len(hechos)} de {len(exes)} ejecutable(s) quedaron bloqueados.')
+    if len(hechos) < len(exes):
+        print(f'  Los que faltan están en {BASE}/centinela.log. Se reintentan en la próxima detección.')
+
+
+def cmd_bloquear(p):
+    existentes = claves_bloqueadas()
+    if existentes is None:
+        sys.exit('  lulu-cli no pudo leer las reglas de LuLu.')
+    hechos = bloquear([p], 'centinela', existentes)
+    escribir('bloqueados.json', fusionar(leer('bloqueados.json', []), hechos))
+    escribir('whitelist.json', [w for w in leer('whitelist.json', []) if w['path'] != p])
+    recargar()
+    print('  Bloqueado.' if hechos else '  No se pudo bloquear (ver centinela.log).')
+
+
+def cmd_whitelist_add(p):
+    bloq = leer('bloqueados.json', [])
+    items = [b for b in bloq if b['path'] == p]
+    restantes = [b for b in bloq if b['path'] != p]
+    if not items:   # pudo haberse bloqueado fuera del registro: se quitan sus claves igual
+        _, clave = firma(p)
+        items = [{'path': p, 'claves': [clave] if clave == p else [clave, p]}]
+    desbloquear(items, restantes)
+    recargar()
+    escribir('bloqueados.json', restantes)
+    wl = [w for w in leer('whitelist.json', []) if w['path'] != p]
+    wl.append({'path': p, 'sha256': sha256(p), 'fecha': ahora()})
+    escribir('whitelist.json', wl)
+    print('  Agregado a la whitelist.')
+
+
+def cmd_proteger_lulu():
+    """Regla que corta la red de la app de LuLu, para que no busque ni descargue versiones
+    nuevas. El filtrado lo hace la extensión de red, no la app. Registra además las versiones
+    de LuLu y macOS para avisar si cambian."""
+    registrar_versiones()
+    existentes = claves_bloqueadas()
+    if existentes is None or not os.path.isfile(LULU_EXE):
+        sys.exit('  No se pudo leer LuLu o lulu-cli.')
+    hechos = bloquear([LULU_EXE], 'lulu-sin-actualizaciones', existentes)
+    escribir('bloqueados.json', fusionar(leer('bloqueados.json', []), hechos))
+    recargar()
+    print('  LuLu queda sin acceso a internet (no se puede actualizar solo).' if hechos
+          else '  No se pudo crear la regla (ver centinela.log).')
+
+
+def cmd_rollback():
+    bloq = leer('bloqueados.json', [])
+    desbloquear(bloq, [])
+    if bloq:
+        recargar()
+    for nombre, vacio in (('bloqueados.json', []), ('zonas.json', []), ('pendientes.json', []), ('estado.json', {})):
+        escribir(nombre, vacio)
+    print(f'  {len(bloq)} ejecutable(s) desbloqueados.')
+
+
+def cmd_detectar():
+    alertas = []
+    salud(alertas)
+    if not (BASE / 'baseline.json').exists():
+        alertas.append(alerta('grave', 'No hay baseline: la detección de cambios no corre. '
+                                       'Créalo en EnsambleSetup → Instalación → Aislador + Centinela.'))
+        guardar_estado(alertas)
+        avisar()
+        return
+    bl = leer('baseline.json', {})
+    base = leer('baseline_exes.json', {})
+    wl = {w['path'] for w in leer('whitelist.json', [])}
+    zonas = leer('zonas.json', [])
+    bloq = leer('bloqueados.json', [])
+    bloq_set = {b['path'] for b in bloq}
+    pend = leer('pendientes.json', [])
+    ids = {x['id'] for x in pend}
+    existentes = claves_bloqueadas() if extension_activa() else None
+    nuevos_bloq, nuevos = [], 0
+
+    for p, st in escanear(vigiladas()).items():
+        if p in bloq_set:
+            continue
+        b, tipo, h = base.get(p), None, ''
+        if b is None:
+            if p in wl:
+                continue
+            tipo = 'NUEVO'
+        elif b['s'] != st.st_size or b['m'] != int(st.st_mtime):
+            h = sha256(p)
+            if h and h != b['h']:
+                tipo = 'MODIFICADO'
+        if not tipo:
+            continue
+        id_ = f'{tipo}|{p}'
+        if id_ in ids:
+            continue
+        zona = en_zona(p, zonas)
+        # Fuera de zona, lo firmado por Apple es el sistema actualizándose: no se reporta.
+        if not zona and firma(p)[0] == 'apple':
+            continue
+        h = h or sha256(p)
+        prov = False
+        if zona and p not in wl and existentes is not None:
+            hechos = bloquear([p], 'provisional', existentes)
+            if hechos:
+                prov = True
+                nuevos_bloq += hechos
+                bloq_set.add(p)
+        pend.append({'id': id_, 'tipo': tipo, 'path': p, 'detalle': '', 'sha256': h,
+                     'en_zona': zona, 'provisional': prov, 'fecha': ahora()})
+        ids.add(id_)
+        nuevos += 1
+
+    base_pers = set(bl.get('persistencia', []))
+    for x in persistencia():
+        id_ = 'PERSISTENCIA|' + x
+        if x in base_pers or id_ in ids:
+            continue
+        pend.append({'id': id_, 'tipo': 'PERSISTENCIA', 'path': exe_de_plist(x), 'detalle': x.split('|')[1],
+                     'firma': x, 'sha256': '', 'en_zona': False, 'provisional': False, 'fecha': ahora()})
+        ids.add(id_)
+        nuevos += 1
+
+    if nuevos_bloq:
+        escribir('bloqueados.json', fusionar(bloq, nuevos_bloq))
+        recargar()
+    escribir('pendientes.json', pend)
+    guardar_estado(alertas)
+    log(f'Detección: {nuevos} nuevo(s), {len(nuevos_bloq)} bloqueado(s) provisionalmente, {len(pend)} pendiente(s).')
+    if pend or alertas:
+        avisar()
+
+
+def usuario_consola():
+    try:
+        uid = os.stat('/dev/console').st_uid
+        return uid if uid != 0 else None
+    except OSError:
+        return None
+
+
+def avisar():
+    uid = usuario_consola()
+    if uid:
+        subprocess.run(['launchctl', 'kickstart', f'gui/{uid}/{LABEL_AGENTE}'], capture_output=True)
+
+
+def cmd_aplicar(huella, lista):
+    if sha256(BASE / 'pendientes.json') != huella:
+        sys.exit('La lista cambió mientras la revisabas (corrió una detección). Vuelve a abrirse en el próximo aviso.')
+    pend = leer('pendientes.json', [])
+    elegidos = set() if lista == 'ninguno' else {int(n) - 1 for n in lista.split(',') if n.strip().isdigit()}
+    bloq = leer('bloqueados.json', [])
+    wl = leer('whitelist.json', [])
+    bl = leer('baseline.json', {})
+    base = leer('baseline_exes.json', {})
+    existentes = claves_bloqueadas() or set()
+    a_desbloquear = []
+
+    for i, x in enumerate(pend):
+        p = x.get('path') or ''
+        if i in elegidos:
+            if p and os.path.exists(p):
+                bloq = fusionar(bloq, bloquear([p], 'centinela', existentes))
+                wl = [w for w in wl if w['path'] != p]
+        elif p and x['tipo'] != 'PERSISTENCIA':
+            if x.get('provisional'):
+                a_desbloquear += [b for b in bloq if b['path'] == p]
+            bloq = [b for b in bloq if b['path'] != p]
+            wl = [w for w in wl if w['path'] != p] + [{'path': p, 'sha256': x.get('sha256', ''), 'fecha': ahora()}]
+        if x['tipo'] == 'PERSISTENCIA':
+            bl.setdefault('persistencia', []).append(x.get('firma') or x.get('detalle'))
+        elif p and os.path.exists(p):
+            st = os.stat(p)
+            base[p] = {'h': x.get('sha256') or sha256(p), 's': st.st_size, 'm': int(st.st_mtime)}
+
+    if a_desbloquear:
+        desbloquear(a_desbloquear, bloq)
+    recargar()
+    escribir('bloqueados.json', bloq)
+    escribir('whitelist.json', wl)
+    escribir('baseline.json', bl)
+    escribir('baseline_exes.json', base)
+    escribir('pendientes.json', [])
+    est = leer('estado.json', {})
+    escribir('estado.json', {'fecha': est.get('fecha', ahora()),
+                             'alertas': [a for a in est.get('alertas', []) if a.get('nivel') == 'grave']})
+    log(f'Revisión: {len(elegidos)} bloqueado(s), {len(pend) - len(elegidos)} a whitelist.')
+
+
+# ─── Pantalla (corre como el usuario de la sesión) ───
+
+def osa(script):
+    return subprocess.run(['osascript', '-'], input=script, capture_output=True, text=True)
+
+
+def as_texto(s):
+    return '"' + s.replace('\\', '\\\\').replace('"', '\\"') + '"'
+
+
+def cmd_revisar():
+    candado = open(f'/tmp/ensamble-centinela-{os.getuid()}.lock', 'w')
+    try:
+        fcntl.flock(candado, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        return   # ya hay una ventana abierta
+
+    est = leer('estado.json', {})
+    alertas = [a for a in est.get('alertas', []) if a]
+    pend = leer('pendientes.json', [])
+
+    # Los avisos informativos se muestran una vez por detección; los graves, siempre.
+    visto = Path.home() / 'Library/Application Support/EnsambleSetup/centinela_visto.txt'
+    ya_visto = visto.exists() and visto.read_text().strip() == est.get('fecha', '')
+    if ya_visto:
+        alertas = [a for a in alertas if a.get('nivel') == 'grave']
+    if alertas:
+        grave = any(a.get('nivel') == 'grave' for a in alertas)
+        osa(f'display alert {as_texto(TITULO)} message {as_texto(chr(10).join(a["texto"] for a in alertas))}'
+            + (' as critical' if grave else ''))
+        visto.parent.mkdir(parents=True, exist_ok=True)
+        visto.write_text(est.get('fecha', ''))
+    if not pend:
+        return
+
+    huella = sha256(BASE / 'pendientes.json')
+    items = []
+    for i, x in enumerate(pend, 1):
+        marca = '  [bloqueado provisionalmente]' if x.get('provisional') else ('  [zona aprobada]' if x.get('en_zona') else '')
+        items.append(f"{i}. {x['tipo']} · {x.get('path') or x.get('detalle')}{marca}")
+    prompt = ('Elige lo que queda BLOQUEADO (Cmd+clic para varios). Lo que no elijas pasa a la whitelist y '
+              'recupera la red. «Decidir después» deja todo pendiente.')
+    script = (
+        f'set sel to choose from list {{{", ".join(as_texto(s) for s in items)}}} with title {as_texto(TITULO)} '
+        f'with prompt {as_texto(prompt)} OK button name "Aplicar" cancel button name "Decidir después" '
+        'with multiple selections allowed and empty selection allowed\n'
+        'if sel is false then return "CANCELAR"\n'
+        'set salida to ""\n'
+        'repeat with s in sel\n'
+        '  set salida to salida & (text 1 thru ((offset of "." in s) - 1) of s) & ","\n'
+        'end repeat\n'
+        'return salida\n'
+    )
+    r = osa(script)
+    salida = r.stdout.strip()
+    if r.returncode != 0 or salida == 'CANCELAR':
+        return
+    elegidos = sorted({int(n) for n in salida.split(',') if n.strip().isdigit()})
+    n_b = len(elegidos)
+    r = osa(f'display dialog {as_texto(f"Se bloquean {n_b}; pasan a whitelist {len(pend) - n_b}. ¿Confirmas?")} '
+            f'with title {as_texto(TITULO)} buttons {{"Cancelar", "Confirmar"}} default button "Confirmar"')
+    if r.returncode != 0:
+        return
+    cmd = ' '.join(shlex.quote(a) for a in (sys.executable, str(Path(__file__).resolve()), 'aplicar', huella,
+                                            ','.join(map(str, elegidos)) or 'ninguno'))
+    r = osa(f'do shell script {as_texto(cmd)} with administrator privileges')
+    if r.returncode != 0:
+        motivo = (r.stderr or r.stdout).strip() or 'se canceló la contraseña'
+        osa(f'display alert {as_texto(TITULO)} message {as_texto("No se aplicó: " + motivo + ". La lista sigue pendiente.")}')
+
+
+if __name__ == '__main__':
+    args = sys.argv[1:] or ['']
+    cmd = args[0]
+    if cmd == 'revisar':
+        cmd_revisar()
+        sys.exit(0)
+    if os.geteuid() != 0:
+        sys.exit('Este comando requiere root.')
+    BASE.mkdir(parents=True, exist_ok=True)
+    if cmd == 'baseline':
+        cmd_baseline()
+    elif cmd == 'aislar' and len(args) >= 2:
+        cmd_aislar(args[1], '--real' in args)
+    elif cmd == 'detectar':
+        cmd_detectar()
+    elif cmd == 'aplicar' and len(args) == 3:
+        cmd_aplicar(args[1], args[2])
+    elif cmd == 'bloquear' and len(args) == 2:
+        cmd_bloquear(args[1])
+    elif cmd == 'whitelist-add' and len(args) == 2:
+        cmd_whitelist_add(args[1])
+    elif cmd == 'proteger-lulu':
+        cmd_proteger_lulu()
+    elif cmd == 'rollback':
+        cmd_rollback()
+    else:
+        sys.exit(__doc__)
+'''
+
 
 
 # ─────────────────────────────────────────────
@@ -1808,7 +3621,7 @@ def seccion_instalacion():
     _submenu("INSTALACIÓN", {
         "1": ("Software básico", seccion_software_basico),
         "2": ("Software profesional", seccion_software_profesional),
-        "3": ("Aislar software profesional de internet", seccion_aislar_software_profesional),
+        "3": ("Aislador + Centinela", seccion_aislador_centinela),
     })
 
 
