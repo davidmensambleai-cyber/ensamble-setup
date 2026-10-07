@@ -570,10 +570,11 @@ def diagnosticar(ubicacion):
 
         # ── Navegador dentro de la oficina ─────────────────────────
         # No basta con que exista el alias en hosts (eso solo dice que el nombre resuelve):
-        # hay que probar que algo responde de verdad en el puerto. Caso real 2026-09-09:
-        # el alias existía y la tarjeta salía verde, pero el navegador no entraba — el
-        # bloqueo era el permiso de Red Local de macOS, invisible para este chequeo, pero
-        # un AMBAR en vez de un VERDE ya deja de afirmar algo que el script no comprobó.
+        # hay que probar que algo responde de verdad en el puerto.
+        # Límite conocido (2026-10-07): el script corre bajo Terminal, que macOS no somete al
+        # permiso de Red local, así que NO puede ver si Chrome lo tiene. Caso real 2026-09-09:
+        # tarjeta verde y Chrome sin entrar. Por eso en Mac el resumen muestra siempre la ruta
+        # del permiso, también en verde.
         if _hosts_tiene_alias():
             http_ok, _ = _https_responde(NAS_HOST_ALIAS, timeout=4.0, esquema="http", puerto=DSM_HTTP_PORT)
             if http_ok:
@@ -1894,11 +1895,15 @@ def resumen_final(ubicacion, capas, resultado):
         print(f"        Si escribes https en vez de http sale una advertencia de seguridad:")
         print(f"        es normal en la red local → \"Avanzado → Continuar\".")
         nav = por_capa.get("Navegador dentro de la oficina")
-        if OS == "Darwin" and nav and nav["estado"] == AMBAR:
+        if OS == "Darwin" and nav and nav["estado"] in (VERDE, AMBAR):
             print()
-            warn("El navegador podría no abrir esa dirección — no es un problema del NAS:")
+            if nav["estado"] == VERDE:
+                warn("El NAS responde. Si aun así tu navegador no abre esa dirección, es un")
+                warn("permiso de macOS que este script no puede ver:")
+            else:
+                warn("El navegador podría no abrir esa dirección — no es un problema del NAS:")
             info("Ajustes del Sistema → Privacidad y seguridad → Red local → activa tu")
-            info("navegador (Chrome, Safari, etc.) y ciérralo y ábrelo de nuevo.")
+            info("navegador (Chrome, Firefox, Edge, etc.) y ciérralo y ábrelo de nuevo.")
     else:
         ts = por_capa.get("Tailscale")
         if ts and ts["estado"] == VERDE:
