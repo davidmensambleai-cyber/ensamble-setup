@@ -684,6 +684,8 @@ VENDORS: dict = {
                 f'{HOME}/Library/Saved Application State/com.microsoft.*',
                 '/Library/Application Support/Microsoft',
                 '/Library/Preferences/com.microsoft.*',
+                # Helpers que corren como root (actualización y licencia de Office).
+                '/Library/PrivilegedHelperTools/com.microsoft.*',
             ],
             'launch_agent_globs': [f'{HOME}/Library/LaunchAgents/com.microsoft.*'],
             'launch_daemon_globs': ['/Library/LaunchDaemons/com.microsoft.*'],
@@ -2162,16 +2164,28 @@ def _globs_mac_todos_los_usuarios(patrones) -> list:
     return salida
 
 
+# Carpetas de datos que VENDORS lista para el desinstalador: al aislar no se usan. Lo que aparece ahí
+# es de paso (p. ej. la actualización descargada de VS Code en Caches/com.microsoft.VSCode.ShipIt) y,
+# como LuLu bloquea por firma, bloquear esa copia le corta la red también al programa instalado.
+CARPETAS_DE_DATOS_MAC = ('/Library/Caches/', '/Library/Preferences/', '/Library/Saved Application State/')
+
+
+def _patrones_aislar_mac(seleccion) -> list:
+    patrones = []
+    for vid in seleccion:
+        perfil = VENDORS[vid].get('mac', {})
+        patrones += perfil.get('app_globs', []) + [
+            p for p in map(str, perfil.get('dir_globs', [])) if not any(d in p for d in CARPETAS_DE_DATOS_MAC)]
+    return patrones
+
+
 def _aislar_mac(dry_run: bool):
     if not _mac_prerrequisitos():
         return
     if not dry_run:
         _mac_firewall_entrante()
     seleccion = _elegir_proveedores('¿Qué proveedores aislar de internet?')
-    patrones = []
-    for vid in seleccion:
-        perfil = VENDORS[vid].get('mac', {})
-        patrones += perfil.get('app_globs', []) + perfil.get('dir_globs', [])
+    patrones = _patrones_aislar_mac(seleccion)
     solicitud = CENTINELA_DIR / "_aislar_solicitud.json"
     CENTINELA_DIR.mkdir(parents=True, exist_ok=True)
     solicitud.write_text(json.dumps(_globs_mac_todos_los_usuarios(patrones)), encoding="utf-8")
@@ -2196,6 +2210,11 @@ def _aislar_mac(dry_run: bool):
     if not confirm(f"¿Bloquear entrada y salida de internet para los {total} ejecutable(s)?"):
         info("Cancelado.")
         return
+    procesos = [p for vid in seleccion for p in VENDORS[vid].get('mac', {}).get('processes', [])]
+    if procesos:
+        warn("Las conexiones que estos programas ya tengan abiertas pueden seguir vivas después del bloqueo.")
+        if confirm("¿Cerrarlos ahora? (guarda antes lo que tengas abierto en ellos)"):
+            kill_processes_mac(procesos)
     info("LuLu se recarga al final: la red queda ~8 s sin filtrar.")
     if _mac_helper("aislar", str(solicitud), "--real").returncode == 0:
         info("Las carpetas de estos proveedores quedan como zonas aprobadas. Activa la vigilancia en la opción 4.")
@@ -2223,6 +2242,8 @@ def _vigilancia_mac():
         'ProgramArguments': [python, str(CENTINELA_MAC_PY), 'detectar'],
         'StartCalendarInterval': [{'Weekday': 1, 'Hour': 13, 'Minute': 30},
                                   {'Weekday': 5, 'Hour': 13, 'Minute': 30}],
+        # macOS no recupera una cita perdida con el equipo apagado: también revisa al encender.
+        'RunAtLoad': True,
         'StandardOutPath': log, 'StandardErrorPath': log,
     }
     agente = {
@@ -2243,9 +2264,9 @@ def _vigilancia_mac():
         subprocess.run(['launchctl', 'bootout', f'gui/{uid}/com.ensamble.centinela.revisar'], capture_output=True)
         run_logged(['launchctl', 'bootstrap', f'gui/{uid}', str(MAC_AGENTE)], 'Cargar la pantalla (LaunchAgent)')
     if ok_d:
-        ok("Vigilancia activa: lunes y viernes 13:30. La pantalla sale sola si hay algo que revisar.")
-        if confirm("¿Correr la primera detección ahora?"):
-            _mac_helper("detectar")
+        ok("Vigilancia activa: lunes y viernes 13:30 y al encender el Mac. Cada revisión termina con una")
+        ok("ventana: la alerta, o «todo en orden». Si un lunes no sale nada, el Centinela se cayó.")
+        info("La primera revisión ya arrancó; su ventana sale en unos segundos.")
 
 
 def _vigilancia_win():
@@ -2375,7 +2396,10 @@ def seccion_centinela_vigilancia():
     info("    quedan bloqueados y lo demás pasa a la whitelist. Si la cierras sin responder,")
     info("    vuelve a salir al iniciar sesión o el siguiente lunes o viernes.")
     if IS_MAC:
-        info("  · en Mac además avisa si LuLu dejó de filtrar, o si cambió LuLu o macOS.")
+        info("  · en Mac además avisa si LuLu dejó de filtrar, o si cambió LuLu o macOS;")
+        info("  · en Mac revisa también al encender, y cada revisión termina con una ventana: la")
+        info("    alerta de infiltración (con botón para copiarla y mandarla por Telegram) o «todo")
+        info("    en orden». Si un lunes no sale ninguna de las dos, el Centinela se cayó.")
     if not confirm("¿Activar la vigilancia automática?"):
         return
     if IS_WIN:
@@ -2901,8 +2925,8 @@ Compatible con Python 3.9 (el de las Command Line Tools de Apple).
 
   baseline                       foto del equipo (root)
   aislar <patrones.json> [--real]  bloquea los ejecutables de las carpetas de proveedores (root)
-  detectar                       LaunchDaemon, lunes y viernes 13:30 (root)
-  revisar                        LaunchAgent, en la sesión del usuario: muestra la lista
+  detectar                       LaunchDaemon, lunes y viernes 13:30 y al encender (root)
+  revisar                        LaunchAgent, en la sesión del usuario: alerta (o "todo en orden") y la lista
   aplicar <huella> <números>     lo llama 'revisar' con contraseña de administrador (root)
   bloquear <ruta> | whitelist-add <ruta> | proteger-lulu | rollback   (root)
 """
@@ -2913,6 +2937,7 @@ import hashlib
 import json
 import os
 import plistlib
+import re
 import shlex
 import struct
 import subprocess
@@ -2921,15 +2946,23 @@ import time
 from datetime import datetime
 from pathlib import Path
 
+# Rutas a nivel de módulo: tests/test_centinela_mac.py las reemplaza por carpetas temporales y una
+# copia de rules.plist, para probar sin tocar el sistema.
 BASE = Path('/Library/Application Support/EnsambleSetup/centinela')
 LULU_CLI = '/usr/local/bin/lulu-cli'
 LULU_APP = '/Applications/LuLu.app'
 LULU_EXE = LULU_APP + '/Contents/MacOS/LuLu'
+LULU_PREFS = '/Library/Objective-See/LuLu/preferences.plist'
 SFW = '/usr/libexec/ApplicationFirewall/socketfilterfw'
+USUARIOS_DIR = '/Users'
+VIGILADAS_SISTEMA = ['/Applications', '/Library/Application Support', '/Library/PrivilegedHelperTools']
+PERSISTENCIA_SISTEMA = ['/Library/LaunchAgents', '/Library/LaunchDaemons']
+# Los dos plist del propio centinela y el modo que cada uno debe ejecutar.
+PROPIOS = {'/Library/LaunchDaemons/com.ensamble.centinela.detectar.plist': 'detectar',
+           '/Library/LaunchAgents/com.ensamble.centinela.revisar.plist': 'revisar'}
 LABEL_AGENTE = 'com.ensamble.centinela.revisar'
 TITULO = 'Centinela · Ensamble'
-# LuLu no se vigila como ejecutable nuevo: su cambio de versión lo reporta salud().
-EXCLUIR = (str(BASE), '/Library/Application Support/Apple/', LULU_APP + '/')
+RECARGA_ESPERA = 10   # macOS reinicia la extensión de LuLu en ~8 s
 
 
 def ahora():
@@ -2982,14 +3015,14 @@ def guardar_estado(alertas):
 
 def usuarios():
     try:
-        return [u for u in Path('/Users').iterdir()
+        return [u for u in Path(USUARIOS_DIR).iterdir()
                 if u.is_dir() and u.name not in ('Shared', 'Guest') and not u.name.startswith('.')]
     except OSError:
         return []
 
 
 def vigiladas():
-    c = ['/Applications', '/Library/Application Support', '/Library/PrivilegedHelperTools']
+    c = list(VIGILADAS_SISTEMA)
     for u in usuarios():
         c += [str(u / 'Applications'), str(u / 'Library/Application Support')]
     return [x for x in c if os.path.isdir(x)]
@@ -3034,6 +3067,12 @@ def es_ejecutable(p):
     return False
 
 
+def excluida(d):
+    """Carpetas que no se vigilan: la del centinela, la de Apple, y LuLu (su cambio de versión lo
+    reporta salud())."""
+    return any(d == x or d.startswith(x + '/') for x in (str(BASE), '/Library/Application Support/Apple', LULU_APP))
+
+
 def escanear(raices):
     r = {}
     for raiz in raices:
@@ -3042,7 +3081,7 @@ def escanear(raices):
                 r[raiz] = os.stat(raiz)
             continue
         for d, subdirs, archivos in os.walk(raiz, onerror=lambda e: None):
-            if d.startswith(EXCLUIR):
+            if excluida(d):
                 subdirs[:] = []
                 continue
             for a in archivos:
@@ -3052,43 +3091,209 @@ def escanear(raices):
     return r
 
 
-def firma(p):
-    """(tipo, clave de LuLu). Replica Process.generateKey de LuLu 4.5.1: firma de Apple o de la
-    App Store → id de firma; Developer ID → 'id:autoridad hoja'; sin firma válida → la ruta."""
+# Requisitos de Gatekeeper: además de validar el binario, exigen que la cadena termine en Apple.
+REQUISITOS = {
+    'apple': 'anchor apple',
+    'appstore': 'anchor apple generic and certificate leaf[field.1.2.840.113635.100.6.1.9] exists',
+    'devid': 'anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] exists '
+             'and certificate leaf[field.1.2.840.113635.100.6.1.13] exists',
+}
+
+
+def leer_firma(p):
+    """Lo que el binario DICE de su firma. codesign -dvv no valida: un binario de Apple alterado
+    sigue mostrando 'Software Signing'. Devuelve (tipo declarado, identificador, autoridad hoja, team)."""
     r = subprocess.run(['codesign', '-dvv', p], capture_output=True, text=True)
-    ident, auths = None, []
+    ident, auths, team = None, [], ''
     for linea in r.stderr.splitlines():
         if linea.startswith('Identifier='):
             ident = linea.split('=', 1)[1].strip()
         elif linea.startswith('Authority='):
             auths.append(linea.split('=', 1)[1].strip())
+        elif linea.startswith('TeamIdentifier='):
+            team = linea.split('=', 1)[1].strip()
     if r.returncode != 0 or not ident or not auths:
-        return 'ninguna', p
-    if auths[0] == 'Software Signing':
-        return 'apple', ident
-    if auths[0] == 'Apple Mac OS Application Signing':
-        return 'appstore', ident
-    if auths[0].startswith('Developer ID Application:'):
-        return 'devid', f'{ident}:{auths[0]}'
-    return 'otra', p
+        return 'ninguna', None, '', ''
+    hoja = auths[0]
+    if hoja == 'Software Signing':
+        tipo = 'apple'
+    elif hoja == 'Apple Mac OS Application Signing':
+        tipo = 'appstore'
+    elif hoja.startswith('Developer ID Application:'):
+        tipo = 'devid'
+    else:
+        tipo = 'otra'
+    return tipo, ident, hoja, ('' if team == 'not set' else team)
 
 
-def persistencia():
+def clave_lulu(p):
+    """Replica Process.generateKey de LuLu 4.5.1: Apple o App Store → id de firma; Developer ID →
+    'id:autoridad hoja'; sin firma → la ruta. Sale de lo declarado, no de lo verificado: si la
+    firma no valida, LuLu usa la ruta, y bloquear() crea también esa regla."""
+    tipo, ident, hoja, _ = leer_firma(p)
+    if tipo in ('apple', 'appstore'):
+        return ident
+    if tipo == 'devid':
+        return f'{ident}:{hoja}'
+    return p
+
+
+def firma(p):
+    """(tipo, team) VERIFICADOS. 'ninguna' si no hay firma, si el binario fue alterado o si la
+    cadena no termina en Apple."""
+    tipo, _, _, team = leer_firma(p)
+    if tipo not in REQUISITOS:
+        return 'ninguna', ''
+    if subprocess.run(['codesign', '--verify', '-R=' + REQUISITOS[tipo], p], capture_output=True).returncode != 0:
+        return 'ninguna', ''
+    return tipo, (team if tipo == 'devid' else '')
+
+
+def es_propio(p):
+    """Los dos plist del centinela, y solo si ejecutan este helper en su modo. Por nombre no basta:
+    cualquier plist puede llamarse com.ensamble.centinela.*"""
+    modo = PROPIOS.get(p)
+    if not modo:
+        return False
+    try:
+        with open(p, 'rb') as f:
+            args = plistlib.load(f).get('ProgramArguments') or []
+    except Exception:
+        return False
+    return (len(args) == 3 and args[0] in ('/usr/bin/python3', sys.executable)
+            and args[1:] == [str(BASE / 'centinela_mac.py'), modo])
+
+
+def persistencia(fallas=None):
+    """Todo lo que puede arrancar solo, como entradas 'tipo|detalle|huella'. Una entrada que no
+    está en el baseline es un cambio. `fallas` recibe el nombre de cada fuente que no se pudo leer:
+    una fuente muda no vigila nada, y devolver vacío la haría pasar por 'sin cambios'."""
+    fallas = [] if fallas is None else fallas
     s = []
-    dirs = ['/Library/LaunchAgents', '/Library/LaunchDaemons'] + [str(u / 'Library/LaunchAgents') for u in usuarios()]
+    dirs = list(PERSISTENCIA_SISTEMA) + [str(u / 'Library/LaunchAgents') for u in usuarios()]
     for d in dirs:
         try:
             nombres = sorted(os.listdir(d))
         except OSError:
             continue
         for n in nombres:
-            if n.endswith('.plist') and not n.startswith('com.ensamble.centinela'):
-                p = os.path.join(d, n)
+            p = os.path.join(d, n)
+            if n.endswith('.plist') and not es_propio(p):
                 s.append(f'plist|{p}|{sha256(p)}')
+    return s + archivos_arranque() + extensiones(fallas) + perfiles(fallas) + items_inicio(fallas)
+
+
+# Otras vías de arranque (I2). Los comandos son de módulo para que las pruebas los reemplacen.
+CMD_BTM = ['sfltool', 'dumpbtm']                       # Ítems de inicio y en segundo plano (root)
+CMD_EXTENSIONES = ['systemextensionsctl', 'list']
+CMD_PERFILES = ['profiles', 'list', '-all']            # root
+CMD_MDM = ['profiles', 'status', '-type', 'enrollment']
+ARCHIVOS_ARRANQUE = ['/usr/lib/cron/tabs', '/etc/crontab', '/etc/periodic', '/etc/periodic.conf',
+                     '/Library/StartupItems']
+ESPERA_COMANDO = 60   # sin root, sfltool se queda esperando una autorización en pantalla
+# Tipos de ítem de inicio que no se reportan: los 'legacy' son los plist que ya cubre el escaneo de
+# LaunchAgents/LaunchDaemons; 'developer' solo agrupa; Spotlight y Vista rápida no ejecutan en arranque.
+BTM_IGNORAR = ('legacy', 'developer', 'spotlight', 'quicklook')
+
+
+def salida_de(cmd, fallas, nombre):
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=ESPERA_COMANDO)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        fallas.append(nombre)
+        log(f'{nombre}: {e}')
+        return None
+    # 'profiles' sin root devuelve 0 y solo avisa en el texto: el código de salida no basta.
+    if r.returncode != 0 or 'requires root' in r.stdout + r.stderr:
+        fallas.append(nombre)
+        log(f'{nombre}: código {r.returncode}: {(r.stderr or r.stdout).strip()[:200]}')
+        return None
+    return r.stdout
+
+
+def limpio(t):
+    return t.replace('|', '/').strip()
+
+
+def archivos_arranque():
+    s = []
+    for raiz in ARCHIVOS_ARRANQUE:
+        if os.path.isfile(raiz):
+            rutas = [raiz]
+        elif os.path.isdir(raiz):
+            rutas = sorted(os.path.join(d, a) for d, _, archivos in os.walk(raiz) for a in archivos)
+        else:
+            continue
+        s += [f'archivo|{p}|{sha256(p)}' for p in rutas]
+    return s
+
+
+def extensiones(fallas):
+    texto = salida_de(CMD_EXTENSIONES, fallas, 'extensiones del sistema')
+    if texto is None:
+        return []
+    s = []
+    for linea in texto.splitlines():
+        c = linea.split('\t')
+        if len(c) >= 6 and c[0].strip() in ('*', ''):   # la cabecera trae 'enabled' en la 1.ª columna
+            s.append(f'extension|{limpio(f"Extensión del sistema: {c[4]} · {c[2]} {c[3]} · {c[5]}")}|')
+    return s
+
+
+def perfiles(fallas):
+    s = []
+    texto = salida_de(CMD_PERFILES, fallas, 'perfiles de configuración')
+    for linea in (texto or '').splitlines():
+        if 'profileIdentifier:' in linea:
+            dueno = linea.split('[', 1)[0].strip()
+            ident = linea.split('profileIdentifier:', 1)[1]
+            s.append(f'perfil|{limpio(f"Perfil de configuración ({dueno}): {ident.strip()}")}|')
+    texto = salida_de(CMD_MDM, fallas, 'inscripción en MDM')
+    for linea in (texto or '').splitlines():
+        if ': Yes' in linea:
+            s.append(f'mdm|{limpio("Administración remota (MDM): " + linea.strip())}|')
+    return s
+
+
+def leer_btm(texto):
+    """Ítems de 'sfltool dumpbtm' como diccionarios. Cada ítem empieza con una línea '#N:' sola;
+    las '#N: identificador' de 'Embedded Item Identifiers' no abren ítem."""
+    uid, actual, items = '', None, []
+    for linea in texto.splitlines():
+        t = linea.strip()
+        if t.startswith('Records for UID'):
+            uid = t[len('Records for UID'):].split(':', 1)[0].strip()
+        elif re.match(r'^#\d+:$', t):
+            actual = {'uid': uid}
+            items.append(actual)
+        elif actual is not None and ': ' in t:
+            k, v = t.split(': ', 1)
+            actual.setdefault(k.strip(), re.sub(r'\s*\(0x[0-9a-fA-F]+\)$', '', v.strip()))
+    return items
+
+
+def items_inicio(fallas):
+    texto = salida_de(CMD_BTM, fallas, 'ítems de inicio')
+    if texto is None:
+        return []
+    s = []
+    for it in leer_btm(texto):
+        tipo = it.get('Type', '')
+        if not tipo or tipo.startswith(BTM_IGNORAR):
+            continue
+        estado = [x.strip() for x in it.get('Disposition', '').strip('[] ').split(',')]
+        donde = it.get('Executable Path') or it.get('URL') or ''
+        detalle = (f"Ítem de inicio ({tipo}, usuario {it['uid']}): {it.get('Name', '?')} · "
+                   f"{it.get('Identifier', '?')} · {it.get('Team Identifier', 'sin equipo')} · {donde} · "
+                   f"{'activo' if 'enabled' in estado else 'apagado'}, "
+                   f"{'permitido' if 'allowed' in estado else 'no permitido'}")
+        s.append(f'btm|{limpio(detalle)}|')
     return s
 
 
 def exe_de_plist(firma_txt):
+    if not firma_txt.startswith('plist|'):
+        return ''
     try:
         with open(firma_txt.split('|')[1], 'rb') as f:
             d = plistlib.load(f)
@@ -3100,42 +3305,66 @@ def exe_de_plist(firma_txt):
 
 # ─── LuLu + socketfilterfw ───
 
+_recarga_pendiente = False
+
+
 def lulu(*args):
-    return subprocess.run([LULU_CLI, *args], capture_output=True, text=True)
+    global _recarga_pendiente
+    r = subprocess.run([LULU_CLI, *args], capture_output=True, text=True)
+    if args[0] in ('add', 'delete-match') and r.returncode == 0:
+        _recarga_pendiente = True
+    return r
 
 
-def claves_bloqueadas():
-    """Claves con una regla 'Block * *' en LuLu, o None si lulu-cli no pudo leer las reglas."""
+def leer_reglas():
+    """(block, apagadas, allow): claves con regla Block '* *' activa, con Block '* *' desactivada,
+    y con cualquier Allow activa. None si lulu-cli no pudo leer las reglas. Una Block desactivada
+    no bloquea, así que no cuenta como puesta."""
     if not os.path.isfile(LULU_CLI):
         return None
     r = lulu('list')
     if r.returncode != 0:
         return None
-    s, actual = set(), None
+    block, apagadas, allow, actual = set(), set(), set(), None
     for linea in r.stdout.splitlines():
         if linea.startswith('[') and linea.endswith(']'):
             actual = linea[1:-1]
         elif actual and '| Block |' in linea and 'addr=* port=*' in linea:
-            s.add(actual)
-    return s
+            (apagadas if '[DISABLED]' in linea else block).add(actual)
+        elif actual and '| Allow |' in linea and '[DISABLED]' not in linea:
+            allow.add(actual)
+    return block, apagadas, allow
 
 
-def bloquear(rutas, origen, existentes):
-    """Bloquea salida (LuLu) y entrada (socketfilterfw). No recarga LuLu: quien llama hace un
-    solo reload al final, porque cada reload deja la red ~8 s sin filtrar.
+def bloquear(rutas, origen, reglas):
+    """Bloquea salida (LuLu) y entrada (socketfilterfw). No recarga LuLu: quien llama recarga una
+    sola vez al final (recargar) y verifica (confirmar). `reglas` es leer_reglas() y se actualiza.
 
-    Con firma válida se crean DOS reglas en LuLu, por id de firma y por ruta: si la firma
-    dejara de validar (binario alterado), LuLu pasa a identificar el proceso por su ruta."""
+    Con firma se crean DOS reglas en LuLu, por clave de firma y por ruta: si la firma dejara de
+    validar (binario alterado), LuLu pasa a identificar el proceso por su ruta. Antes se quitan las
+    Allow de esa clave (LuLu las crea solo con "permitir apps instaladas" y no está probado cuál
+    gana) y las Block desactivadas."""
+    block, apagadas, allow = reglas
     hechos = []
     for p in rutas:
-        _, clave = firma(p)
+        clave = clave_lulu(p)
         claves = [clave] if clave == p else [clave, p]
         todo_ok = True
         for k in claves:
-            if k in existentes:
+            if k in allow:
+                if lulu('delete-match', '--key', k, '--action', 'allow').returncode == 0:
+                    allow.discard(k)
+                else:
+                    todo_ok = False
+                    log(f'lulu-cli no pudo quitar la regla de permitir de {k}')
+            if k in apagadas:
+                lulu('delete-match', '--key', k, '--action', 'block', '--addr', '*', '--port', '*')
+                apagadas.discard(k)
+                block.discard(k)
+            if k in block:
                 continue
             if lulu('add', '--key', k, '--path', p, '--action', 'block', '--addr', '*', '--port', '*').returncode == 0:
-                existentes.add(k)
+                block.add(k)
             else:
                 todo_ok = False
                 log(f'lulu-cli add falló para {k}')
@@ -3159,9 +3388,36 @@ def desbloquear(items, restantes):
 
 
 def recargar():
+    """Recarga LuLu solo si algo cambió: cada recarga deja la red ~8 s sin filtrar."""
+    global _recarga_pendiente
+    if not _recarga_pendiente:
+        return True
+    _recarga_pendiente = False
     ok = lulu('reload').returncode == 0
-    time.sleep(10)   # macOS reinicia la extensión en ~8 s
+    time.sleep(RECARGA_ESPERA)
     return ok
+
+
+def confirmar(hechos):
+    """Tras recargar, deja solo lo que de verdad quedó en LuLu: Block activa y ninguna Allow encima.
+    LuLu reescribe rules.plist cuando crea sus reglas 'baseline'; si lo hace entre nuestro add y la
+    recarga, la regla se pierde sin aviso. Se reintenta una vez."""
+    faltan = []
+    for intento in (1, 2):
+        reglas = leer_reglas()
+        if reglas is None:
+            log('Verificación: lulu-cli no pudo leer las reglas.')
+            return []
+        block, _, allow = reglas
+        faltan = [h for h in hechos if any(k not in block or k in allow for k in h['claves'])]
+        if not faltan:
+            return hechos
+        if intento == 1:
+            log(f'Verificación: {len(faltan)} sin regla tras recargar; se reintenta.')
+            bloquear([h['path'] for h in faltan], None, reglas)
+            recargar()
+    log('Verificación: siguen sin regla: ' + ', '.join(h['path'] for h in faltan))
+    return [h for h in hechos if h not in faltan]
 
 
 def fusionar(bloq, hechos):
@@ -3202,6 +3458,8 @@ def salud(alertas):
     fw = subprocess.run([SFW, '--getglobalstate'], capture_output=True, text=True).stdout.lower()
     if 'disabled' in fw or 'enabled' not in fw:
         alertas.append(alerta('grave', 'El firewall de macOS está apagado: los bloqueos de conexiones entrantes no tienen efecto.'))
+    preferencias(alertas)
+    endurecimiento(alertas)
 
     reg = leer('versiones.json', {})
     v_lulu, v_mac = version_app(LULU_APP), version_macos()
@@ -3212,22 +3470,60 @@ def salud(alertas):
         alertas.append(alerta('grave', f"macOS cambió de versión ({reg['macos']} → {v_mac}). Verifica que LuLu siga filtrando."))
     registrar_versiones()
 
-    existentes = claves_bloqueadas()
-    if existentes is None:
+    reglas = leer_reglas()
+    if reglas is None:
         alertas.append(alerta('grave', 'lulu-cli no pudo leer las reglas de LuLu (¿falta, o cambió el formato con una '
                                        'actualización?). No se pueden crear ni restaurar bloqueos.'))
         return
+    block, _, allow = reglas
     bloq = leer('bloqueados.json', [])
-    faltan = [b for b in bloq if os.path.exists(b['path']) and any(k not in existentes for k in b.get('claves', []))]
+    # Borrada, desactivada, o con una regla de permitir encima: las tres dejan pasar el tráfico.
+    faltan = [b for b in bloq if os.path.exists(b['path'])
+              and any(k not in block or k in allow for k in b.get('claves', []))]
     if faltan:
-        bloquear([b['path'] for b in faltan], None, existentes)
+        hechos = bloquear([b['path'] for b in faltan], None, reglas)
         recargar()
-        aun = claves_bloqueadas() or set()
-        perdidas = [b for b in faltan if any(k not in aun for k in b.get('claves', []))]
+        puestos = {h['path'] for h in confirmar(hechos)}
+        perdidas = [b for b in faltan if b['path'] not in puestos]
         if perdidas:
             alertas.append(alerta('grave', f'No se pudieron restaurar las reglas de {len(perdidas)} ejecutable(s) en LuLu.'))
         else:
-            alertas.append(alerta('info', f'Se restauraron las reglas de {len(faltan)} ejecutable(s) que ya no estaban en LuLu.'))
+            alertas.append(alerta('info', f'Se repararon las reglas de {len(faltan)} ejecutable(s): estaban borradas, '
+                                          'desactivadas o con una regla de permitir encima.'))
+
+
+def preferencias(alertas):
+    """Ajustes de LuLu que dejan pasar todo sin que la extensión deje de verse activa."""
+    try:
+        with open(LULU_PREFS, 'rb') as f:
+            prefs = plistlib.load(f)
+    except Exception:
+        alertas.append(alerta('grave', 'No se pudieron leer las preferencias de LuLu.'))
+        return
+    if prefs.get('disabled'):
+        alertas.append(alerta('grave', 'LuLu está desactivado desde su menú: no está filtrando nada. Vuelve a activarlo.'))
+    if prefs.get('useAllowList'):
+        alertas.append(alerta('grave', 'LuLu tiene activa una lista global de permitidos: puede dejar pasar '
+                                       'programas bloqueados.'))
+    if prefs.get('allowInstalled'):
+        alertas.append(alerta('info', 'LuLu está creando reglas propias de "permitir" (opción "Permitir apps '
+                                      'instaladas"). El centinela las quita de los programas bloqueados, pero '
+                                      'conviene desactivar esa opción en los ajustes de LuLu.'))
+
+
+def endurecimiento(alertas):
+    """Sin SIP, Gatekeeper o FileVault, lo demás se puede saltar desde abajo."""
+    def salida(cmd):
+        try:
+            return subprocess.run(cmd, capture_output=True, text=True).stdout.strip()
+        except OSError:
+            return ''
+    if not salida(['csrutil', 'status']).startswith('System Integrity Protection status: enabled.'):
+        alertas.append(alerta('grave', 'La Protección de Integridad del Sistema (SIP) de macOS no está activa.'))
+    if 'assessments enabled' not in salida(['spctl', '--status']):
+        alertas.append(alerta('grave', 'Gatekeeper está apagado: macOS deja abrir programas sin verificar su firma.'))
+    if not salida(['fdesetup', 'status']).startswith('FileVault is On.'):
+        alertas.append(alerta('grave', 'FileVault está apagado: el disco no está cifrado.'))
 
 
 # ─── Comandos (root) ───
@@ -3239,9 +3535,12 @@ def cmd_baseline():
     for i, (p, st) in enumerate(exes.items(), 1):
         if i % 250 == 0:
             print(f'  {i}/{len(exes)} ejecutables con hash...')
-        datos[p] = {'h': sha256(p), 's': st.st_size, 'm': int(st.st_mtime)}
-    print('  Registrando persistencia (LaunchAgents y LaunchDaemons)...')
-    pers = persistencia()
+        datos[p] = {'h': sha256(p), 's': st.st_size, 'm': int(st.st_mtime), 't': firma(p)[1]}
+    print('  Registrando lo que arranca solo (LaunchAgents/Daemons, ítems de inicio, extensiones, perfiles, cron)...')
+    fallas = []
+    pers = persistencia(fallas)
+    if fallas:
+        print(f'  AVISO: no se pudo leer {", ".join(fallas)}. Ver {BASE}/centinela.log.')
     escribir('baseline_exes.json', datos)
     escribir('baseline.json', {'creado': ahora(), 'equipo': os.uname().nodename, 'exes': len(datos), 'persistencia': pers})
     log(f'Baseline: {len(datos)} ejecutables, {len(pers)} entradas de persistencia.')
@@ -3259,29 +3558,31 @@ def cmd_aislar(archivo, real):
             print(f'  Se bloquearía: {p}' + ('   (ya tenía regla)' if p in ya else ''))
         print(f'TOTAL {len(exes)}')
         return
-    existentes = claves_bloqueadas()
-    if existentes is None:
+    reglas = leer_reglas()
+    if reglas is None:
         sys.exit('  lulu-cli no pudo leer las reglas de LuLu. No se bloqueó nada.')
     print(f'  Bloqueando {len(exes)} ejecutable(s)...')
-    hechos = bloquear(exes, 'proveedor', existentes)
+    hechos = bloquear(exes, 'proveedor', reglas)
+    recargar()
+    hechos = confirmar(hechos)
     escribir('bloqueados.json', fusionar(leer('bloqueados.json', []), hechos))
     zonas = leer('zonas.json', [])
     escribir('zonas.json', sorted(set(zonas) | {r for r in raices if os.path.isdir(r)}))
-    recargar()
-    print(f'  {len(hechos)} de {len(exes)} ejecutable(s) quedaron bloqueados.')
+    print(f'  {len(hechos)} de {len(exes)} ejecutable(s) quedaron bloqueados (verificado en LuLu).')
     if len(hechos) < len(exes):
         print(f'  Los que faltan están en {BASE}/centinela.log. Se reintentan en la próxima detección.')
 
 
 def cmd_bloquear(p):
-    existentes = claves_bloqueadas()
-    if existentes is None:
+    reglas = leer_reglas()
+    if reglas is None:
         sys.exit('  lulu-cli no pudo leer las reglas de LuLu.')
-    hechos = bloquear([p], 'centinela', existentes)
+    hechos = bloquear([p], 'centinela', reglas)
+    recargar()
+    hechos = confirmar(hechos)
     escribir('bloqueados.json', fusionar(leer('bloqueados.json', []), hechos))
     escribir('whitelist.json', [w for w in leer('whitelist.json', []) if w['path'] != p])
-    recargar()
-    print('  Bloqueado.' if hechos else '  No se pudo bloquear (ver centinela.log).')
+    print('  Bloqueado (verificado en LuLu).' if hechos else '  No se pudo bloquear (ver centinela.log).')
 
 
 def cmd_whitelist_add(p):
@@ -3289,7 +3590,7 @@ def cmd_whitelist_add(p):
     items = [b for b in bloq if b['path'] == p]
     restantes = [b for b in bloq if b['path'] != p]
     if not items:   # pudo haberse bloqueado fuera del registro: se quitan sus claves igual
-        _, clave = firma(p)
+        clave = clave_lulu(p)
         items = [{'path': p, 'claves': [clave] if clave == p else [clave, p]}]
     desbloquear(items, restantes)
     recargar()
@@ -3305,12 +3606,13 @@ def cmd_proteger_lulu():
     nuevas. El filtrado lo hace la extensión de red, no la app. Registra además las versiones
     de LuLu y macOS para avisar si cambian."""
     registrar_versiones()
-    existentes = claves_bloqueadas()
-    if existentes is None or not os.path.isfile(LULU_EXE):
+    reglas = leer_reglas()
+    if reglas is None or not os.path.isfile(LULU_EXE):
         sys.exit('  No se pudo leer LuLu o lulu-cli.')
-    hechos = bloquear([LULU_EXE], 'lulu-sin-actualizaciones', existentes)
-    escribir('bloqueados.json', fusionar(leer('bloqueados.json', []), hechos))
+    hechos = bloquear([LULU_EXE], 'lulu-sin-actualizaciones', reglas)
     recargar()
+    hechos = confirmar(hechos)
+    escribir('bloqueados.json', fusionar(leer('bloqueados.json', []), hechos))
     print('  LuLu queda sin acceso a internet (no se puede actualizar solo).' if hechos
           else '  No se pudo crear la regla (ver centinela.log).')
 
@@ -3325,7 +3627,28 @@ def cmd_rollback():
     print(f'  {len(bloq)} ejecutable(s) desbloqueados.')
 
 
+ESPERA_ARRANQUE = 600   # al encender: 10 min para que LuLu y la red levanten (David, 2026-10-16); sin esto sale "LuLu no filtra"
+ARRANQUE_RECIENTE = 300
+
+
+def segundos_encendido():
+    r = subprocess.run(['sysctl', '-n', 'kern.boottime'], capture_output=True, text=True).stdout
+    try:
+        return time.time() - int(r.split('sec =')[1].split(',')[0])
+    except (IndexError, ValueError):
+        return ARRANQUE_RECIENTE + 1
+
+
 def cmd_detectar():
+    # Corre lunes y viernes 13:30 y al encender (RunAtLoad): si coinciden, la segunda no hace nada.
+    candado = open(BASE / 'detectar.lock', 'w')
+    try:
+        fcntl.flock(candado, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        log('Detección: ya hay otra corriendo; esta no hace nada.')
+        return
+    if segundos_encendido() < ARRANQUE_RECIENTE:
+        time.sleep(ESPERA_ARRANQUE)
     alertas = []
     salud(alertas)
     if not (BASE / 'baseline.json').exists():
@@ -3342,61 +3665,104 @@ def cmd_detectar():
     bloq_set = {b['path'] for b in bloq}
     pend = leer('pendientes.json', [])
     ids = {x['id'] for x in pend}
-    existentes = claves_bloqueadas() if extension_activa() else None
-    nuevos_bloq, nuevos = [], 0
+    reglas = leer_reglas() if extension_activa() else None
+    raices = vigiladas()
+    equipos = equipos_por_app(base, raices)
+    nuevos_bloq, nuevos, n_pers, aceptados, base_cambio = [], [], 0, 0, False
 
-    for p, st in escanear(vigiladas()).items():
+    for p, st in escanear(raices).items():
         if p in bloq_set:
             continue
-        b, tipo, h = base.get(p), None, ''
-        if b is None:
-            if p in wl:
-                continue
-            tipo = 'NUEVO'
-        elif b['s'] != st.st_size or b['m'] != int(st.st_mtime):
-            h = sha256(p)
-            if h and h != b['h']:
-                tipo = 'MODIFICADO'
-        if not tipo:
+        b = base.get(p)
+        if b is None and p in wl:
             continue
+        # Siempre por hash: el tamaño y la fecha se pueden conservar a propósito al alterar un binario.
+        h = sha256(p)
+        if b is not None and (not h or h == b['h']):
+            continue
+        tipo = 'NUEVO' if b is None else 'MODIFICADO'
         id_ = f'{tipo}|{p}'
         if id_ in ids:
             continue
         zona = en_zona(p, zonas)
-        # Fuera de zona, lo firmado por Apple es el sistema actualizándose: no se reporta.
-        if not zona and firma(p)[0] == 'apple':
-            continue
-        h = h or sha256(p)
+        if not zona:
+            # Fuera de zona no se pregunta por el sistema (Apple), la App Store, ni lo firmado por el
+            # mismo desarrollador que ya tenía esa app en el baseline: son actualizaciones.
+            t, team = firma(p)
+            if t in ('apple', 'appstore') or (t == 'devid' and team in equipos.get(app_de(p, raices), ())):
+                base[p] = {'h': h, 's': st.st_size, 'm': int(st.st_mtime), 't': team}
+                base_cambio = True
+                if t == 'devid':
+                    aceptados += 1
+                    log(f'Aceptado por firmante {team}: {p}')
+                continue
         prov = False
-        if zona and p not in wl and existentes is not None:
-            hechos = bloquear([p], 'provisional', existentes)
+        if zona and p not in wl and reglas is not None:
+            hechos = bloquear([p], 'provisional', reglas)
             if hechos:
                 prov = True
                 nuevos_bloq += hechos
                 bloq_set.add(p)
-        pend.append({'id': id_, 'tipo': tipo, 'path': p, 'detalle': '', 'sha256': h,
-                     'en_zona': zona, 'provisional': prov, 'fecha': ahora()})
+        x = {'id': id_, 'tipo': tipo, 'path': p, 'detalle': '', 'sha256': h,
+             'en_zona': zona, 'provisional': prov, 'fecha': ahora()}
+        pend.append(x)
+        nuevos.append(x)
         ids.add(id_)
-        nuevos += 1
 
     base_pers = set(bl.get('persistencia', []))
-    for x in persistencia():
+    fallas = []
+    for x in persistencia(fallas):
         id_ = 'PERSISTENCIA|' + x
         if x in base_pers or id_ in ids:
             continue
         pend.append({'id': id_, 'tipo': 'PERSISTENCIA', 'path': exe_de_plist(x), 'detalle': x.split('|')[1],
                      'firma': x, 'sha256': '', 'en_zona': False, 'provisional': False, 'fecha': ahora()})
         ids.add(id_)
-        nuevos += 1
+        n_pers += 1
+    if fallas:
+        alertas.append(alerta('grave', f'No se pudo revisar: {", ".join(fallas)}. Lo que arranque solo por esa '
+                                       'vía no se está vigilando. Ver centinela.log.'))
 
     if nuevos_bloq:
-        escribir('bloqueados.json', fusionar(bloq, nuevos_bloq))
         recargar()
+        puestos = {h['path'] for h in confirmar(nuevos_bloq)}
+        for x in nuevos:
+            if x['provisional'] and x['path'] not in puestos:
+                x['provisional'] = False
+        if len(puestos) < len(nuevos_bloq):
+            alertas.append(alerta('grave', f'No se pudieron bloquear provisionalmente {len(nuevos_bloq) - len(puestos)} '
+                                           'ejecutable(s) nuevo(s) en zona aprobada. Ver centinela.log.'))
+        nuevos_bloq = [h for h in nuevos_bloq if h['path'] in puestos]
+        escribir('bloqueados.json', fusionar(bloq, nuevos_bloq))
+    if base_cambio:
+        escribir('baseline_exes.json', base)
     escribir('pendientes.json', pend)
     guardar_estado(alertas)
-    log(f'Detección: {nuevos} nuevo(s), {len(nuevos_bloq)} bloqueado(s) provisionalmente, {len(pend)} pendiente(s).')
-    if pend or alertas:
-        avisar()
+    log(f'Detección: {len(nuevos) + n_pers} nuevo(s), {len(nuevos_bloq)} bloqueado(s) provisionalmente, '
+        f'{aceptados} aceptado(s) por firmante, {len(pend)} pendiente(s).')
+    avisar()   # siempre: si un lunes no sale ni la alerta ni el "todo en orden", el Centinela se cayó (R4)
+
+
+def app_de(p, raices):
+    """Unidad del filtro por firmante: el .app más externo de la ruta; fuera de un .app, la carpeta
+    de primer nivel dentro de la carpeta vigilada (p. ej. .../Application Support/Microsoft)."""
+    partes = p.split('/')
+    for i, parte in enumerate(partes):
+        if parte.endswith('.app'):
+            return '/'.join(partes[:i + 1])
+    for raiz in sorted(raices, key=len, reverse=True):
+        r = raiz.rstrip('/') + '/'
+        if p.startswith(r):
+            return r + p[len(r):].split('/')[0]
+    return os.path.dirname(p)
+
+
+def equipos_por_app(base, raices):
+    r = {}
+    for p, d in base.items():
+        if d.get('t'):
+            r.setdefault(app_de(p, raices), set()).add(d['t'])
+    return r
 
 
 def usuario_consola():
@@ -3422,14 +3788,14 @@ def cmd_aplicar(huella, lista):
     wl = leer('whitelist.json', [])
     bl = leer('baseline.json', {})
     base = leer('baseline_exes.json', {})
-    existentes = claves_bloqueadas() or set()
-    a_desbloquear = []
+    reglas = leer_reglas() or (set(), set(), set())
+    a_desbloquear, nuevos = [], []
 
     for i, x in enumerate(pend):
         p = x.get('path') or ''
         if i in elegidos:
             if p and os.path.exists(p):
-                bloq = fusionar(bloq, bloquear([p], 'centinela', existentes))
+                nuevos += bloquear([p], 'centinela', reglas)
                 wl = [w for w in wl if w['path'] != p]
         elif p and x['tipo'] != 'PERSISTENCIA':
             if x.get('provisional'):
@@ -3440,11 +3806,15 @@ def cmd_aplicar(huella, lista):
             bl.setdefault('persistencia', []).append(x.get('firma') or x.get('detalle'))
         elif p and os.path.exists(p):
             st = os.stat(p)
-            base[p] = {'h': x.get('sha256') or sha256(p), 's': st.st_size, 'm': int(st.st_mtime)}
+            base[p] = {'h': x.get('sha256') or sha256(p), 's': st.st_size, 'm': int(st.st_mtime), 't': firma(p)[1]}
 
     if a_desbloquear:
-        desbloquear(a_desbloquear, bloq)
+        desbloquear(a_desbloquear, bloq + nuevos)
     recargar()
+    confirmados = confirmar(nuevos)
+    if len(confirmados) < len(nuevos):
+        log(f'Revisión: {len(nuevos) - len(confirmados)} elegido(s) no quedaron bloqueados en LuLu.')
+    bloq = fusionar(bloq, confirmados)
     escribir('bloqueados.json', bloq)
     escribir('whitelist.json', wl)
     escribir('baseline.json', bl)
@@ -3466,6 +3836,52 @@ def as_texto(s):
     return '"' + s.replace('\\', '\\\\').replace('"', '\\"') + '"'
 
 
+ENCABEZADO_ALERTA = '⚠️ Alerta de infiltración web — Centinela Ensamble'
+PIE_ALERTA = 'Copia este mensaje y envíalo por Telegram a David o a Sebastián.'
+TIPOS_LEGIBLES = {'NUEVO': 'Programa nuevo', 'MODIFICADO': 'Programa modificado',
+                  'PERSISTENCIA': 'Arranque automático nuevo'}
+MAX_ITEMS_ALERTA = 12
+
+
+def fecha_legible(iso):
+    try:
+        return datetime.strptime(iso, '%Y-%m-%dT%H:%M:%S').strftime('%Y-%m-%d %H:%M')
+    except (TypeError, ValueError):
+        return str(iso)
+
+
+def nombre_equipo():
+    r = subprocess.run(['scutil', '--get', 'ComputerName'], capture_output=True, text=True)
+    return r.stdout.strip() or os.uname().nodename
+
+
+def mensaje_infiltracion(est, graves, pend):
+    lineas = [ENCABEZADO_ALERTA, f'Equipo: {nombre_equipo()} · {fecha_legible(est.get("fecha"))}', '']
+    if pend:
+        lineas.append('Apareció:')
+        for x in pend[:MAX_ITEMS_ALERTA]:
+            ya = ' (ya bloqueado)' if x.get('provisional') else ''
+            lineas.append(f"• {TIPOS_LEGIBLES.get(x['tipo'], x['tipo'])}{ya}: {x.get('path') or x.get('detalle')}")
+        if len(pend) > MAX_ITEMS_ALERTA:
+            lineas.append(f'• … y {len(pend) - MAX_ITEMS_ALERTA} más')
+        lineas.append('')
+    if graves:
+        lineas.append('Además:')
+        lineas += [f"• {a['texto']}" for a in graves]
+        lineas.append('')
+    lineas.append(PIE_ALERTA)
+    return '\n'.join(lineas)
+
+
+def alerta_infiltracion(est, graves, pend):
+    """Ventana con el mensaje y un botón que lo deja en el portapapeles, listo para Telegram."""
+    texto = mensaje_infiltracion(est, graves, pend)
+    titulo, cuerpo = texto.split('\n', 1)
+    osa(f'set r to button returned of (display alert {as_texto(titulo)} message {as_texto(cuerpo.strip())} '
+        'as critical buttons {"Cerrar", "Copiar mensaje"} default button "Copiar mensaje")\n'
+        f'if r is "Copiar mensaje" then set the clipboard to {as_texto(texto)}\n')
+
+
 def cmd_revisar():
     candado = open(f'/tmp/ensamble-centinela-{os.getuid()}.lock', 'w')
     try:
@@ -3475,17 +3891,26 @@ def cmd_revisar():
 
     est = leer('estado.json', {})
     alertas = [a for a in est.get('alertas', []) if a]
+    graves = [a for a in alertas if a.get('nivel') == 'grave']
+    infos = [a for a in alertas if a.get('nivel') != 'grave']
     pend = leer('pendientes.json', [])
 
-    # Los avisos informativos se muestran una vez por detección; los graves, siempre.
+    # Cada detección se anuncia una vez, haya o no hallazgos: que un lunes no salga nada es la señal de
+    # que el Centinela se cayó (R4). Lo grave y lo pendiente se repiten hasta que se resuelve.
     visto = Path.home() / 'Library/Application Support/EnsambleSetup/centinela_visto.txt'
     ya_visto = visto.exists() and visto.read_text().strip() == est.get('fecha', '')
-    if ya_visto:
-        alertas = [a for a in alertas if a.get('nivel') == 'grave']
-    if alertas:
-        grave = any(a.get('nivel') == 'grave' for a in alertas)
-        osa(f'display alert {as_texto(TITULO)} message {as_texto(chr(10).join(a["texto"] for a in alertas))}'
-            + (' as critical' if grave else ''))
+    mostrado = False
+    if graves or pend:
+        alerta_infiltracion(est, graves, pend)
+        mostrado = True
+    if infos and not ya_visto:
+        osa(f'display alert {as_texto(TITULO)} message {as_texto(chr(10).join(a["texto"] for a in infos))}')
+        mostrado = True
+    if not mostrado and not ya_visto and est.get('fecha'):
+        osa(f'display alert {as_texto(TITULO)} message '
+            f'{as_texto("Revisión del " + fecha_legible(est["fecha"]) + " hecha: todo en orden.")}')
+        mostrado = True
+    if mostrado:
         visto.parent.mkdir(parents=True, exist_ok=True)
         visto.write_text(est.get('fecha', ''))
     if not pend:
