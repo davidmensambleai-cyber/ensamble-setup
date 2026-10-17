@@ -2108,11 +2108,14 @@ def _aislar_win(dry_run: bool):
 
 def _mac_helper(*args, capturar=False):
     """Escribe el helper del centinela (siempre, para que quede al día) y lo ejecuta."""
+    python = _python_mac()
+    if python is None:
+        return subprocess.CompletedProcess(args, 1, '', '')
     CENTINELA_DIR.mkdir(parents=True, exist_ok=True)
     os.chmod(CENTINELA_DIR, 0o755)
     CENTINELA_MAC_PY.write_text(CENTINELA_MAC_CODIGO, encoding="utf-8")
     os.chmod(CENTINELA_MAC_PY, 0o755)
-    cmd = [_python_mac(), str(CENTINELA_MAC_PY), *args]
+    cmd = [python, str(CENTINELA_MAC_PY), *args]
     if capturar:
         return subprocess.run(cmd, capture_output=True, text=True)
     return subprocess.run(cmd)
@@ -2123,6 +2126,12 @@ def _python_mac() -> str:
     de ruta al actualizarse; uno de Homebrew sí, y dejaría las tareas apuntando a la nada."""
     if subprocess.run(['xcode-select', '-p'], capture_output=True).returncode == 0:
         return '/usr/bin/python3'
+    # En el ejecutable de doble clic, sys.executable es el propio ejecutable: launchd lo abriría
+    # como menú, no como helper. None = no continuar.
+    if getattr(sys, 'frozen', False):
+        err("Faltan las Command Line Tools de Apple (traen el Python que usa el Centinela).")
+        info("Instálalas con:  xcode-select --install   y vuelve a abrir el programa.")
+        return None
     return sys.executable
 
 
@@ -2179,6 +2188,14 @@ def _patrones_aislar_mac(seleccion) -> list:
     return patrones
 
 
+def _cerrar_apps_mac(processes: list):
+    """Como kill_processes_mac, pero solo el ejecutable de cada app (.../Contents/MacOS/<nombre>...).
+    `pkill -f OneDrive` mataba también a VS Code o Claude Code abiertos sobre una carpeta de OneDrive."""
+    for proc in processes:
+        subprocess.run(['pkill', '-f', f'/Contents/MacOS/{proc}'], capture_output=True)
+    time.sleep(1)
+
+
 def _aislar_mac(dry_run: bool):
     if not _mac_prerrequisitos():
         return
@@ -2214,7 +2231,7 @@ def _aislar_mac(dry_run: bool):
     if procesos:
         warn("Las conexiones que estos programas ya tengan abiertas pueden seguir vivas después del bloqueo.")
         if confirm("¿Cerrarlos ahora? (guarda antes lo que tengas abierto en ellos)"):
-            kill_processes_mac(procesos)
+            _cerrar_apps_mac(procesos)
     info("LuLu se recarga al final: la red queda ~8 s sin filtrar.")
     if _mac_helper("aislar", str(solicitud), "--real").returncode == 0:
         info("Las carpetas de estos proveedores quedan como zonas aprobadas. Activa la vigilancia en la opción 4.")
@@ -2230,7 +2247,7 @@ def _uid_consola():
 
 def _vigilancia_mac():
     import plistlib
-    if not _mac_prerrequisitos():
+    if not _mac_prerrequisitos() or _python_mac() is None:
         return
     _mac_firewall_entrante()
     info("Cortando la red de la app de LuLu para que no se actualice sola...")
@@ -3570,7 +3587,8 @@ def cmd_aislar(archivo, real):
     escribir('zonas.json', sorted(set(zonas) | {r for r in raices if os.path.isdir(r)}))
     print(f'  {len(hechos)} de {len(exes)} ejecutable(s) quedaron bloqueados (verificado en LuLu).')
     if len(hechos) < len(exes):
-        print(f'  Los que faltan están en {BASE}/centinela.log. Se reintentan en la próxima detección.')
+        # No se reintentan solos: no quedan en bloqueados.json y la detección salta lo que no cambió.
+        print(f'  Los que faltan están en {BASE}/centinela.log. Vuelve a correr "2 Aislar": lo ya bloqueado se salta.')
 
 
 def cmd_bloquear(p):
