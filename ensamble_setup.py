@@ -775,8 +775,13 @@ VENDORS: dict = {
                 f'{HOME}/Library/Caches/com.autodesk.*',
                 f'{HOME}/Library/Preferences/com.autodesk.*',
                 '/Library/Application Support/Autodesk',
+                # Helpers que corren como root (instalación y licencia), como los de Office (I4).
+                '/Library/PrivilegedHelperTools/com.autodesk.*',
             ],
-            'launch_agent_globs': [f'{HOME}/Library/LaunchAgents/com.autodesk.*'],
+            'launch_agent_globs': [
+                f'{HOME}/Library/LaunchAgents/com.autodesk.*',
+                '/Library/LaunchAgents/com.autodesk.*',
+            ],
             'launch_daemon_globs': ['/Library/LaunchDaemons/com.autodesk.*'],
             'pkg_prefixes': ['com.autodesk.'],
             'processes': ['Autodesk', 'AutoCAD', 'AdskLicensing'],
@@ -844,9 +849,15 @@ VENDORS: dict = {
                 f'{HOME}/Library/Preferences/com.graphisoft.*',
                 f'{HOME}/Library/Caches/com.graphisoft.*',
                 '/Library/Application Support/GRAPHISOFT',
+                '/Library/PrivilegedHelperTools/com.graphisoft.*',
             ],
-            'launch_agent_globs': [f'{HOME}/Library/LaunchAgents/com.graphisoft.*'],
+            'launch_agent_globs': [
+                f'{HOME}/Library/LaunchAgents/com.graphisoft.*',
+                '/Library/LaunchAgents/com.graphisoft.*',
+            ],
             'launch_daemon_globs': ['/Library/LaunchDaemons/com.graphisoft.*'],
+            # CodeMeter (com.wibu.*) no va aquí: lo usan otros programas y el desinstalador de Archicad
+            # no debe llevárselo. Se aísla con LICENCIAS_COMPARTIDAS_MAC.
             'pkg_prefixes': ['com.graphisoft.'],
             'processes': ['Archicad', 'GRAPHISOFT', 'ArchiCAD'],
         },
@@ -1948,11 +1959,11 @@ def _registrar_bloqueados_win(rutas, origen):
     _cj_escribir("bloqueados.json", bloq)
 
 
-def _elegir_proveedores(pregunta: str) -> list:
-    vendor_ids = list(VENDORS.keys())
+def _elegir_proveedores(pregunta: str, catalogo: dict = VENDORS) -> list:
+    vendor_ids = list(catalogo.keys())
     print(f'\n  {pregunta}')
     for i, vid in enumerate(vendor_ids, 1):
-        print(f'    [{i}] {VENDORS[vid]["label"]}')
+        print(f'    [{i}] {catalogo[vid]["label"]}')
     print('  Números separados por coma (ej: 2,3) o "todos":')
     while True:
         choice = input('\n  Tu selección: ').strip().lower()
@@ -2178,13 +2189,52 @@ def _globs_mac_todos_los_usuarios(patrones) -> list:
 # como LuLu bloquea por firma, bloquear esa copia le corta la red también al programa instalado.
 CARPETAS_DE_DATOS_MAC = ('/Library/Caches/', '/Library/Preferences/', '/Library/Saved Application State/')
 
+# Solo para aislar en Mac. No van en VENDORS porque VENDORS es también el catálogo del desinstalador:
+# ahí Parallels se llevaría las máquinas virtuales. El Windows de adentro no se aísla con estas reglas
+# (su tráfico no es confiable de atribuir desde el Mac): se aísla quitándole la tarjeta de red en
+# Parallels. Esto corta solo al programa del Mac (actualizaciones, telemetría). Ver protocolo-centinela-mac.md.
+AISLAR_EXTRA_MAC: dict = {
+    'parallels': {
+        'label': 'Parallels Desktop (solo el programa del Mac)',
+        'mac': {
+            # prl_client_app y Parallels Service.app (prl_disp_service, root) viven dentro de la app;
+            # versiones viejas ponían el servicio en /Library/Parallels. Verificado por documentación
+            # (foro y guía de Parallels, 2026-10-19), no contra una instalación del 26.
+            'app_globs': ['/Applications/Parallels Desktop.app'],
+            'dir_globs': [
+                '/Library/PrivilegedHelperTools/com.parallels.*',
+                '/Library/Application Support/Parallels',
+                '/Library/Parallels',
+            ],
+            'launch_agent_globs': [f'{HOME}/Library/LaunchAgents/com.parallels.*', '/Library/LaunchAgents/com.parallels.*'],
+            'launch_daemon_globs': ['/Library/LaunchDaemons/com.parallels.*'],
+            # Sin 'processes': cerrar Parallels a la fuerza con un Windows encendido lo apaga sin guardar.
+            # El protocolo pide apagar Windows y cerrar Parallels antes de aislar.
+        },
+    },
+}
+PERFILES_AISLAR_MAC: dict = {**VENDORS, **AISLAR_EXTRA_MAC}
+
+# Gestor de licencias CodeMeter (WIBU), el de Archicad: el equivalente Mac de SHARED_LICENSING_PATHS.
+# Servidor: /Applications/CodeMeter.app/Contents/MacOS/CodeMeterMacX (LaunchDaemon com.wibu.CodeMeter.Server);
+# datos en /Library/Application Support/CodeMeter (guía de administración de WIBU y soporte de Graphisoft,
+# 2026-10-19). Las dos últimas rutas no salen en la documentación: si no existen, no encuentran nada.
+LICENCIAS_COMPARTIDAS_MAC = [
+    '/Applications/CodeMeter*',
+    '/Library/Application Support/CodeMeter',
+    '/Library/PrivilegedHelperTools/com.wibu.*',
+    '/usr/local/bin/cmu',
+]
+
 
 def _patrones_aislar_mac(seleccion) -> list:
     patrones = []
     for vid in seleccion:
-        perfil = VENDORS[vid].get('mac', {})
+        perfil = PERFILES_AISLAR_MAC[vid].get('mac', {})
         patrones += perfil.get('app_globs', []) + [
             p for p in map(str, perfil.get('dir_globs', [])) if not any(d in p for d in CARPETAS_DE_DATOS_MAC)]
+    if 'graphisoft' in seleccion:
+        patrones += LICENCIAS_COMPARTIDAS_MAC
     return patrones
 
 
@@ -2201,7 +2251,7 @@ def _aislar_mac(dry_run: bool):
         return
     if not dry_run:
         _mac_firewall_entrante()
-    seleccion = _elegir_proveedores('¿Qué proveedores aislar de internet?')
+    seleccion = _elegir_proveedores('¿Qué proveedores aislar de internet?', PERFILES_AISLAR_MAC)
     patrones = _patrones_aislar_mac(seleccion)
     solicitud = CENTINELA_DIR / "_aislar_solicitud.json"
     CENTINELA_DIR.mkdir(parents=True, exist_ok=True)
@@ -2211,8 +2261,9 @@ def _aislar_mac(dry_run: bool):
     r = _mac_helper("aislar", str(solicitud), capturar=True)
     lineas = r.stdout.splitlines()
     total = next((int(l.split()[1]) for l in lineas if l.startswith('TOTAL ')), 0)
+    choques = next((int(l.split()[1]) for l in lineas if l.startswith('CHOQUES ')), 0)
     for l in lineas:
-        if not l.startswith('TOTAL '):
+        if not l.startswith(('TOTAL ', 'CHOQUES ')):
             print(l)
     if r.returncode != 0:
         err((r.stderr or '').strip() or "El escaneo falló.")
@@ -2221,13 +2272,18 @@ def _aislar_mac(dry_run: bool):
         ok("No se encontraron ejecutables en las carpetas de los proveedores seleccionados.")
         return
     info(f"{total} ejecutable(s) encontrado(s).")
+    if choques:
+        warn(f"{choques} choque(s) de firma (líneas CHOQUE de arriba): bloquear le cortaría la red a otro programa.")
+        warn("Resolver con /asesor-ti antes del modo real; el modo real no bloquea nada mientras existan.")
     if dry_run:
         ok("Simulación completa. Sin cambios realizados.")
+        return
+    if choques:
         return
     if not confirm(f"¿Bloquear entrada y salida de internet para los {total} ejecutable(s)?"):
         info("Cancelado.")
         return
-    procesos = [p for vid in seleccion for p in VENDORS[vid].get('mac', {}).get('processes', [])]
+    procesos = [p for vid in seleccion for p in PERFILES_AISLAR_MAC[vid].get('mac', {}).get('processes', [])]
     if procesos:
         warn("Las conexiones que estos programas ya tengan abiertas pueden seguir vivas después del bloqueo.")
         if confirm("¿Cerrarlos ahora? (guarda antes lo que tengas abierto en ellos)"):
@@ -3564,17 +3620,48 @@ def cmd_baseline():
     print(f'  {len(datos)} ejecutables y {len(pers)} entradas de persistencia registrados.')
 
 
+def choques_de_firma(exes, ya_bloqueados):
+    """(de la lista, de afuera) para cada ejecutable de las carpetas vigiladas que NO se va a bloquear
+    pero comparte clave de LuLu con uno que sí. LuLu bloquea por firma: bloquear uno le corta la red
+    también al otro. Pasó el 2026-10-16: la actualización descargada de VS Code tenía la firma del VS
+    Code instalado. Sin firma la clave es la ruta, que no choca con nada."""
+    claves = {}
+    for p in exes:
+        k = clave_lulu(p)
+        if k != p:
+            claves.setdefault(k, p)
+    if not claves:
+        return []
+    lista = set(exes) | set(ya_bloqueados)
+    choques = []
+    for q in sorted(escanear(vigiladas())):
+        if q in lista:
+            continue
+        k = clave_lulu(q)
+        if k in claves:
+            choques.append((claves[k], q))
+    return choques
+
+
 def cmd_aislar(archivo, real):
     patrones = json.loads(Path(archivo).read_text(encoding='utf-8'))
     raices = sorted({p for pat in patrones for p in glob.glob(pat)})
     wl = {w['path'] for w in leer('whitelist.json', [])}
     exes = sorted(p for p in escanear(raices) if p not in wl)
+    ya = {b['path'] for b in leer('bloqueados.json', [])}
+    choques = choques_de_firma(exes, ya)
     if not real:
-        ya = {b['path'] for b in leer('bloqueados.json', [])}
         for p in exes:
             print(f'  Se bloquearía: {p}' + ('   (ya tenía regla)' if p in ya else ''))
+        for p, q in choques:
+            print(f'  CHOQUE: {p} tiene la misma firma que {q}, que no es del proveedor')
         print(f'TOTAL {len(exes)}')
+        print(f'CHOQUES {len(choques)}')
         return
+    if choques:
+        for p, q in choques:
+            log(f'Aislar detenido, choque de firma: {p} = {q}')
+        sys.exit(f'  {len(choques)} choque(s) de firma: no se bloqueó nada. Correr la simulación para verlos.')
     reglas = leer_reglas()
     if reglas is None:
         sys.exit('  lulu-cli no pudo leer las reglas de LuLu. No se bloqueó nada.')
