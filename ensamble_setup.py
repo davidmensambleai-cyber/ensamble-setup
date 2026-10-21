@@ -2246,6 +2246,47 @@ def _cerrar_apps_mac(processes: list):
     time.sleep(1)
 
 
+def _resolver_choques_mac(pares):
+    """Numera los ejecutables del proveedor que chocan; los elegidos pasan a la whitelist, el resto se
+    bloquea (y con ellos la copia de afuera de misma firma). None = cancelar sin bloquear nada."""
+    afuera = {}
+    for p, q in pares:
+        afuera.setdefault(p, []).append(q)
+    rutas = list(afuera)
+    print("\n  Choques de firma: bloquear uno de estos también le corta la red al de afuera.")
+    for i, p in enumerate(rutas, 1):
+        print(f"\n  [{i}] {p}")
+        for q in afuera[p]:
+            print(f"      misma firma que: {q}")
+    print("\n  Los que elijas pasan a la WHITELIST (conservan internet). Los demás se BLOQUEAN.")
+    print("  Escribe los números separados por coma, sin espacios. Ejemplo para elegir el 1 y el 3:  1,3")
+    print("  Enter sin escribir nada = ninguno a whitelist: se bloquean todos.")
+    while True:
+        texto = input("\n  Números para whitelist: ").strip()
+        try:
+            nums = sorted({int(x) for x in texto.split(',') if x.strip()})
+        except ValueError:
+            print("  Entrada inválida. Solo números separados por coma, ej: 1,3")
+            continue
+        if any(n < 1 or n > len(rutas) for n in nums):
+            print(f"  Número fuera de rango (válidos: 1 a {len(rutas)}).")
+            continue
+        break
+    elegidos = [rutas[n - 1] for n in nums]
+    bloquear = [p for p in rutas if p not in elegidos]
+    for p in elegidos:
+        info(f"A whitelist: {p}")
+    if bloquear:
+        warn("Se van a BLOQUEAR estos, y los de afuera con su misma firma quedarán también sin internet:")
+        for p in bloquear:
+            print(f"      {p}")
+            for q in afuera[p]:
+                print(f"        → también sin red: {q}")
+    if not confirm("¿Confirmas?"):
+        return None
+    return elegidos
+
+
 def _aislar_mac(dry_run: bool):
     if not _mac_prerrequisitos():
         return
@@ -2255,15 +2296,18 @@ def _aislar_mac(dry_run: bool):
     patrones = _patrones_aislar_mac(seleccion)
     solicitud = CENTINELA_DIR / "_aislar_solicitud.json"
     CENTINELA_DIR.mkdir(parents=True, exist_ok=True)
-    solicitud.write_text(json.dumps(_globs_mac_todos_los_usuarios(patrones)), encoding="utf-8")
+    solicitud.write_text(json.dumps({'patrones': _globs_mac_todos_los_usuarios(patrones),
+                                     'proveedores': [PERFILES_AISLAR_MAC[v]['label'] for v in seleccion]}),
+                         encoding="utf-8")
 
     info("\nBuscando ejecutables (puede tardar)...")
     r = _mac_helper("aislar", str(solicitud), capturar=True)
     lineas = r.stdout.splitlines()
     total = next((int(l.split()[1]) for l in lineas if l.startswith('TOTAL ')), 0)
     choques = next((int(l.split()[1]) for l in lineas if l.startswith('CHOQUES ')), 0)
+    pares = [json.loads(l[len('CHOQUE_PAR '):]) for l in lineas if l.startswith('CHOQUE_PAR ')]
     for l in lineas:
-        if not l.startswith(('TOTAL ', 'CHOQUES ')):
+        if not l.startswith(('TOTAL ', 'CHOQUES ', 'CHOQUE_PAR ')):
             print(l)
     if r.returncode != 0:
         err((r.stderr or '').strip() or "El escaneo falló.")
@@ -2274,12 +2318,23 @@ def _aislar_mac(dry_run: bool):
     info(f"{total} ejecutable(s) encontrado(s).")
     if choques:
         warn(f"{choques} choque(s) de firma (líneas CHOQUE de arriba): bloquear le cortaría la red a otro programa.")
-        warn("Resolver con /asesor-ti antes del modo real; el modo real no bloquea nada mientras existan.")
+        warn("En el modo real se listan numerados y eliges cuáles pasan a la whitelist.")
     if dry_run:
         ok("Simulación completa. Sin cambios realizados.")
         return
-    if choques:
-        return
+    aceptar = []
+    if pares:
+        elegidos = _resolver_choques_mac(pares)
+        if elegidos is None:
+            info("Cancelado. No se bloqueó nada.")
+            return
+        for p in elegidos:
+            _mac_helper("whitelist-add", p)
+        total -= len(elegidos)
+        aceptar = ["--aceptar-choques"] if len(elegidos) < len({p for p, _ in pares}) else []
+        if not total:
+            ok("Todo quedó en la whitelist: no hay nada que bloquear.")
+            return
     if not confirm(f"¿Bloquear entrada y salida de internet para los {total} ejecutable(s)?"):
         info("Cancelado.")
         return
@@ -2289,8 +2344,15 @@ def _aislar_mac(dry_run: bool):
         if confirm("¿Cerrarlos ahora? (guarda antes lo que tengas abierto en ellos)"):
             _cerrar_apps_mac(procesos)
     info("LuLu se recarga al final: la red queda ~8 s sin filtrar.")
-    if _mac_helper("aislar", str(solicitud), "--real").returncode == 0:
-        info("Las carpetas de estos proveedores quedan como zonas aprobadas. Activa la vigilancia en la opción 4.")
+    if _mac_helper("aislar", str(solicitud), "--real", *aceptar).returncode == 0:
+        info("Las carpetas de estos proveedores quedan como zonas aprobadas.")
+        info("Todo esto queda EN PRUEBA: si algo deja de funcionar, usa la opción 5 (Volver al último estado aprobado).")
+        if MAC_AGENTE.exists():
+            ok("La ventana del Centinela sale en unos segundos: lo que quedó sin internet y los arranques")
+            ok("automáticos nuevos para que decidas cuáles apagar.")
+        else:
+            warn("La vigilancia NO está activa en este equipo: actívala una vez con la opción 4.")
+            warn("Sin ella no sale la ventana para decidir los arranques automáticos.")
 
 
 def _uid_consola():
@@ -2380,9 +2442,11 @@ Unregister-ScheduledTask -TaskName '{TAREA_VIEJA}' -Confirm:$false -ErrorAction 
 # ─── Opciones del submenú ───
 
 def seccion_centinela_baseline():
-    title("AISLADOR + CENTINELA · CREAR BASELINE")
-    warn("El baseline es la foto de lo que se considera legítimo en este equipo. Tómalo con el")
-    warn("equipo limpio: si ya hay algo malicioso instalado, quedará registrado como normal.")
+    title("AISLADOR + CENTINELA · CREAR EL ESTADO APROBADO INICIAL")
+    warn("El estado aprobado es la foto de lo que se considera legítimo en este equipo (baseline).")
+    warn("Tómalo con el equipo limpio: si ya hay algo malicioso instalado, quedará registrado como normal.")
+    if IS_MAC:
+        info("Después crece solo: lo que apruebes tras aislar cada programa se le va sumando.")
     if IS_MAC and not _mac_prerrequisitos():
         return
     if _cj_leer("pendientes.json", []):
@@ -2419,10 +2483,10 @@ def seccion_aislar_software_profesional():
 
 def seccion_centinela_whitelist():
     while True:
-        title("AISLADOR + CENTINELA · WHITELIST")
+        title("AISLADOR + CENTINELA · EXCEPCIONES: PROGRAMAS QUE CONSERVAN INTERNET")
         wl = _cj_leer("whitelist.json", [])
         if not wl:
-            info("La whitelist está vacía.")
+            info("No hay excepciones: ningún programa de los proveedores conserva internet.")
         for i, e in enumerate(wl, 1):
             print(f"  [{i}] {e['path']}   ({e.get('fecha', '')})")
         print("\n  [a] Agregar una ruta" + ("   [q] Quitar una entrada" if wl else "") + "   [0] Volver")
@@ -2459,16 +2523,21 @@ def seccion_centinela_whitelist():
 def seccion_centinela_vigilancia():
     title("AISLADOR + CENTINELA · VIGILANCIA AUTOMÁTICA")
     if not (CENTINELA_DIR / "baseline.json").exists():
-        err("Primero crea el baseline (opción 1).")
+        err("Primero crea el estado aprobado inicial (opción 1).")
         return
     info("Lunes y viernes a las 13:30 (si el equipo está apagado, al encenderlo en Windows):")
     info("  · restaura las reglas de bloqueo que alguien haya borrado;")
-    info("  · compara contra el baseline; lo nuevo dentro de una zona aprobada queda bloqueado")
-    info("    provisionalmente;")
-    info("  · si hay algo, abre sola una ventana con la lista numerada: los números que elijas")
-    info("    quedan bloqueados y lo demás pasa a la whitelist. Si la cierras sin responder,")
-    info("    vuelve a salir al iniciar sesión o el siguiente lunes o viernes.")
+    if IS_WIN:
+        info("  · compara contra el baseline; lo nuevo dentro de una zona aprobada queda bloqueado")
+        info("    provisionalmente;")
+        info("  · si hay algo, abre sola una ventana con la lista numerada: los números que elijas")
+        info("    quedan bloqueados y lo demás pasa a la whitelist. Si la cierras sin responder,")
+        info("    vuelve a salir al iniciar sesión o el siguiente lunes o viernes.")
     if IS_MAC:
+        info("  · compara contra el estado aprobado: lo nuevo de un proveedor aislado queda sin")
+        info("    internet solo; lo nuevo de afuera solo se informa;")
+        info("  · pregunta los arranques automáticos nuevos: eliges cuáles apagar, y lo demás sigue")
+        info("    arrancando solo. Todo queda en prueba 30 días, o hasta el próximo «2 Aislar»;")
         info("  · en Mac además avisa si LuLu dejó de filtrar, o si cambió LuLu o macOS;")
         info("  · en Mac revisa también al encender, y cada revisión termina con una ventana: la")
         info("    alerta de infiltración (con botón para copiarla y mandarla por Telegram) o «todo")
@@ -2481,10 +2550,37 @@ def seccion_centinela_vigilancia():
         _vigilancia_mac()
 
 
+def seccion_centinela_volver():
+    title("AISLADOR + CENTINELA · VOLVER AL ÚLTIMO ESTADO APROBADO")
+    if IS_WIN:
+        info("Todavía no está disponible en Windows: primero se deja perfecto en el Mac.")
+        return
+    prueba = _cj_leer("prueba.json", {})
+    if not prueba.get("acciones"):
+        ok("No hay nada en prueba: este equipo ya está en el último estado aprobado.")
+        return
+    info(f"En prueba desde el {prueba.get('desde', '?').replace('T', ' ')[:16]}: "
+         f"{len(prueba['acciones'])} cambio(s) desde el último estado aprobado.")
+    warn("Se deshace TODO lo que está en prueba:")
+    warn("  · los programas que quedaron sin internet en la prueba recuperan internet;")
+    warn("  · los arranques automáticos que apagaste se vuelven a encender;")
+    warn("  · el Centinela te vuelve a preguntar los arranques automáticos.")
+    info("No desinstala ningún programa. Para volver a aislarlo, usa la opción 2.")
+    if not confirm("¿Volver al último estado aprobado?"):
+        return
+    if _mac_helper("volver").returncode == 0:
+        ok("Hecho. La ventana del Centinela sale en unos segundos con los arranques para decidir de nuevo.")
+    else:
+        err("No se pudo volver al estado aprobado (ver el motivo arriba).")
+
+
 def seccion_centinela_rollback():
-    title("AISLADOR + CENTINELA · ROLLBACK")
+    title("AISLADOR + CENTINELA · QUITAR EL CENTINELA POR COMPLETO")
     warn("Quita TODAS las reglas de bloqueo del aislador y del centinela y apaga la vigilancia.")
-    info("El baseline y la whitelist se conservan.")
+    if IS_MAC:
+        warn("También vuelve a encender los arranques automáticos que el Centinela haya apagado.")
+    info("Solo para desinstalarlo. Si algo dejó de funcionar tras aislar un programa, usa la opción 5.")
+    info("El estado aprobado y las excepciones se conservan.")
     if not confirm("¿Continuar?"):
         return
     if IS_WIN:
@@ -2509,16 +2605,17 @@ def seccion_centinela_rollback():
         for ruta in (MAC_DAEMON, MAC_AGENTE):
             ruta.unlink(missing_ok=True)
         info("La regla que impedía que LuLu se actualice también se quitó.")
-    ok("Rollback completo.")
+    ok("El Centinela quedó quitado por completo.")
 
 
 def seccion_aislador_centinela():
     _submenu("INSTALACIÓN · AISLADOR + CENTINELA", {
-        "1": ("Crear baseline (foto del equipo limpio)", seccion_centinela_baseline),
+        "1": ("Crear el estado aprobado inicial (foto del equipo limpio)", seccion_centinela_baseline),
         "2": ("Aislar proveedores de internet", seccion_aislar_software_profesional),
-        "3": ("Whitelist", seccion_centinela_whitelist),
+        "3": ("Excepciones: programas que conservan internet", seccion_centinela_whitelist),
         "4": ("Activar vigilancia automática (lunes y viernes 13:30)", seccion_centinela_vigilancia),
-        "5": ("Rollback: quitar bloqueos y vigilancia", seccion_centinela_rollback),
+        "5": ("Volver al último estado aprobado", seccion_centinela_volver),
+        "6": ("Quitar el Centinela por completo", seccion_centinela_rollback),
     })
 
 
@@ -3001,7 +3098,13 @@ Compatible con Python 3.9 (el de las Command Line Tools de Apple).
   detectar                       LaunchDaemon, lunes y viernes 13:30 y al encender (root)
   revisar                        LaunchAgent, en la sesión del usuario: alerta (o "todo en orden") y la lista
   aplicar <huella> <números>     lo llama 'revisar' con contraseña de administrador (root)
+  volver                         vuelve al último estado aprobado: deshace lo que está en prueba (root)
   bloquear <ruta> | whitelist-add <ruta> | proteger-lulu | rollback   (root)
+
+Estados (decisión de David, 2026-10-21): el baseline es el ESTADO APROBADO y crece. Lo que cambia
+después (bloqueos, zonas, arranques apagados o aceptados) queda EN PRUEBA en prueba.json. La prueba
+pasa a aprobada al correr de nuevo "2 Aislar" o a los DIAS_PRUEBA días; 'volver' la deshace entera.
+Internet no se pregunta: lo de las zonas se bloquea solo. Lo que se pregunta es el arranque automático.
 """
 
 import fcntl
@@ -3036,6 +3139,17 @@ PROPIOS = {'/Library/LaunchDaemons/com.ensamble.centinela.detectar.plist': 'dete
 LABEL_AGENTE = 'com.ensamble.centinela.revisar'
 TITULO = 'Centinela · Ensamble'
 RECARGA_ESPERA = 10   # macOS reinicia la extensión de LuLu en ~8 s
+DIAS_PRUEBA = 30      # sin un "2 Aislar" nuevo, lo que está en prueba se aprueba solo a los 30 días
+# Carpeta de plist → dominio de launchctl. 'gui' = uno por cada usuario del equipo.
+DOMINIOS_PERSISTENCIA = {'/Library/LaunchDaemons': 'system', '/Library/LaunchAgents': 'gui'}
+# Arranques de licencia de los proveedores del Centinela (búsqueda web del 2026-10-21; fuentes en
+# protocolo-centinela-mac.md §C). Se comparan en minúsculas contra nombre, identificador y ruta.
+LICENCIA_SEGURA = ('licens', 'activation', 'genuine', 'adobegc', 'gc.invoker', 'com.adobe.ags',
+                   'agsservice', 'codemeter', 'wibu', 'com.parallels.desktop.launchdaemon')
+LICENCIA_POSIBLE = ('adskaccessservicehost',)   # solo aparece en guías de desinstalación de Autodesk
+# Un plist con alguna de estas claves arranca solo; sin ninguna, solo corre cuando un programa lo llama.
+CLAVES_ARRANQUE = ('RunAtLoad', 'KeepAlive', 'StartInterval', 'StartCalendarInterval', 'WatchPaths',
+                   'QueueDirectories', 'StartOnMount')
 
 
 def ahora():
@@ -3082,8 +3196,9 @@ def alerta(nivel, texto):
     return {'nivel': nivel, 'texto': texto}
 
 
-def guardar_estado(alertas):
-    escribir('estado.json', {'fecha': ahora(), 'alertas': alertas})
+def guardar_estado(alertas, informe=()):
+    """'informe' es lo que pasó y no se decide (bloqueos, avisos): se muestra una sola vez."""
+    escribir('estado.json', {'fecha': ahora(), 'alertas': alertas, 'informe': list(informe)})
 
 
 def usuarios():
@@ -3376,6 +3491,130 @@ def exe_de_plist(firma_txt):
         return ''
 
 
+# ─── Arranques automáticos: qué se decide, y cómo se apaga ───
+
+def launchctl(*args):
+    return subprocess.run(['launchctl', *args], capture_output=True, text=True)
+
+
+def es_licencia(texto):
+    t = texto.lower()
+    if any(k in t for k in LICENCIA_SEGURA):
+        return 'licencia'
+    return 'posible' if any(k in t for k in LICENCIA_POSIBLE) else ''
+
+
+def dominios_de(p):
+    """Dominios de launchctl donde corre el plist p. Un LaunchAgent de /Library corre en la sesión
+    de cada usuario, así que se apaga en todas."""
+    for carpeta, dominio in DOMINIOS_PERSISTENCIA.items():
+        if p.startswith(carpeta.rstrip('/') + '/'):
+            if dominio != 'gui':
+                return [dominio]
+            return sorted({f'gui/{u.stat().st_uid}' for u in usuarios()})
+    for u in usuarios():
+        if p.startswith(str(u / 'Library/LaunchAgents') + '/'):
+            return [f'gui/{u.stat().st_uid}']
+    return []
+
+
+def deshabilitado(dominio, label):
+    salida = launchctl('print-disabled', dominio).stdout
+    return f'"{label}" => disabled' in salida or f'"{label}" => true' in salida
+
+
+RE_BTM = re.compile(r'^Ítem de inicio \((?P<tipo>[^,]+), usuario (?P<uid>-?\d+)\): (?P<nombre>.*?) · '
+                    r'(?P<ident>.*?) · (?P<team>.*?) · (?P<donde>.*?) · (?P<act>activo|apagado), '
+                    r'(?P<perm>permitido|no permitido)$')
+
+
+def arranque_de(firma_txt):
+    """El arranque automático que representa una entrada de persistencia(), o None si la entrada no
+    es un arranque (extensión, perfil, cron...). 'activo' = arranca solo al encender o al iniciar
+    sesión; solo esos se preguntan. 'clave' junta las anotaciones repetidas: macOS guarda los ítems
+    de inicio en tres listas (usuario -2, 0 y el de la persona) y un mismo programa sale en las tres."""
+    tipo, _, resto = firma_txt.partition('|')
+    if tipo == 'plist':
+        p = resto.split('|')[0]
+        try:
+            with open(p, 'rb') as f:
+                d = plistlib.load(f)
+        except Exception:
+            d = {}
+        label = d.get('Label') or os.path.basename(p)[:-len('.plist')]
+        prog = d.get('Program') or (d.get('ProgramArguments') or [''])[0]
+        dominios = dominios_de(p)
+        arranca = any(d.get(k) for k in CLAVES_ARRANQUE)
+        apagado = bool(d.get('Disabled')) or bool(dominios and all(deshabilitado(x, label) for x in dominios))
+        return {'clave': 'plist|' + p, 'clase': 'servicio', 'nombre': label, 'detalle': p, 'plist': p,
+                'label': label, 'dominios': dominios, 'activo': arranca and not apagado,
+                'estado': 'apagado' if apagado else ('arranca solo' if arranca else 'a pedido'),
+                'licencia': es_licencia(' '.join((label, p, str(prog))))}
+    if tipo == 'btm':
+        m = RE_BTM.match(resto.split('|')[0])
+        if not m:
+            return None
+        activo = m['act'] == 'activo' and m['perm'] == 'permitido'
+        return {'clave': 'btm|' + m['ident'], 'clase': 'app', 'nombre': m['nombre'],
+                'detalle': m['donde'].replace('file://', '').replace('%20', ' '), 'activo': activo,
+                'estado': 'arranca solo' if activo else 'apagado',
+                'licencia': es_licencia(' '.join((m['nombre'], m['ident'], m['donde'])))}
+    return None
+
+
+def apagar_servicio(a):
+    """Apaga un servicio de launchd en todos sus dominios. Reversible: no borra ni edita el plist,
+    solo deja la marca de 'deshabilitado' de launchctl. True solo si quedó verificado."""
+    if not a.get('dominios'):
+        return False
+    for d in a['dominios']:
+        launchctl('disable', f'{d}/{a["label"]}')
+        launchctl('bootout', f'{d}/{a["label"]}')
+    ok = all(deshabilitado(d, a['label']) for d in a['dominios'])
+    log(f'Arranque automático {"apagado" if ok else "NO se pudo apagar"}: {a["label"]} ({", ".join(a["dominios"])})')
+    return ok
+
+
+def encender_servicio(a):
+    for d in a.get('dominios', []):
+        launchctl('enable', f'{d}/{a["label"]}')
+        if a.get('plist') and os.path.isfile(a['plist']):
+            launchctl('bootstrap', d, a['plist'])   # falla si ya corre o el usuario no tiene sesión: da igual
+    log(f'Arranque automático encendido de nuevo: {a["label"]}')
+
+
+# ─── Estado en prueba ───
+
+def anotar_prueba(acciones):
+    if not acciones:
+        return
+    p = leer('prueba.json', {})
+    p.setdefault('desde', ahora())
+    p.setdefault('acciones', []).extend(acciones)
+    escribir('prueba.json', p)
+
+
+def dias_desde(iso):
+    try:
+        return (datetime.now() - datetime.strptime(iso, '%Y-%m-%dT%H:%M:%S')).days
+    except (TypeError, ValueError):
+        return 0
+
+
+def promover(motivo):
+    """Lo que está en prueba pasa al estado aprobado. Ya está escrito en el baseline: aprobar es
+    dejar de poder deshacerlo con 'volver'."""
+    p = leer('prueba.json', {})
+    if not p.get('acciones'):
+        return False
+    hist = leer('aprobaciones.json', [])
+    hist.append({'desde': p.get('desde'), 'aprobado': ahora(), 'motivo': motivo, 'cambios': len(p['acciones'])})
+    escribir('aprobaciones.json', hist)
+    escribir('prueba.json', {})
+    log(f'Estado en prueba aprobado ({motivo}): {len(p["acciones"])} cambio(s) pasan al estado aprobado.')
+    return True
+
+
 # ─── LuLu + socketfilterfw ───
 
 _recarga_pendiente = False
@@ -3616,6 +3855,7 @@ def cmd_baseline():
         print(f'  AVISO: no se pudo leer {", ".join(fallas)}. Ver {BASE}/centinela.log.')
     escribir('baseline_exes.json', datos)
     escribir('baseline.json', {'creado': ahora(), 'equipo': os.uname().nodename, 'exes': len(datos), 'persistencia': pers})
+    escribir('prueba.json', {})   # una foto nueva es un estado aprobado nuevo: no queda nada en prueba
     log(f'Baseline: {len(datos)} ejecutables, {len(pers)} entradas de persistencia.')
     print(f'  {len(datos)} ejecutables y {len(pers)} entradas de persistencia registrados.')
 
@@ -3643,8 +3883,11 @@ def choques_de_firma(exes, ya_bloqueados):
     return choques
 
 
-def cmd_aislar(archivo, real):
-    patrones = json.loads(Path(archivo).read_text(encoding='utf-8'))
+def cmd_aislar(archivo, real, aceptar_choques=False, revisar_despues=True):
+    solicitud = json.loads(Path(archivo).read_text(encoding='utf-8'))
+    # El menú manda {'patrones', 'proveedores'}; una lista sola es el formato anterior.
+    patrones = solicitud if isinstance(solicitud, list) else solicitud.get('patrones', [])
+    proveedores = [] if isinstance(solicitud, list) else solicitud.get('proveedores', [])
     raices = sorted({p for pat in patrones for p in glob.glob(pat)})
     wl = {w['path'] for w in leer('whitelist.json', [])}
     exes = sorted(p for p in escanear(raices) if p not in wl)
@@ -3655,27 +3898,44 @@ def cmd_aislar(archivo, real):
             print(f'  Se bloquearía: {p}' + ('   (ya tenía regla)' if p in ya else ''))
         for p, q in choques:
             print(f'  CHOQUE: {p} tiene la misma firma que {q}, que no es del proveedor')
+            print('CHOQUE_PAR ' + json.dumps([p, q]))   # para el menú, que numera los choques
         print(f'TOTAL {len(exes)}')
         print(f'CHOQUES {len(choques)}')
         return
-    if choques:
+    if choques and not aceptar_choques:
         for p, q in choques:
             log(f'Aislar detenido, choque de firma: {p} = {q}')
         sys.exit(f'  {len(choques)} choque(s) de firma: no se bloqueó nada. Correr la simulación para verlos.')
+    for p, q in choques:   # el usuario eligió bloquearlos igual en el menú
+        log(f'Choque de firma aceptado al aislar: {p} = {q} (los dos quedan sin red)')
     reglas = leer_reglas()
     if reglas is None:
         sys.exit('  lulu-cli no pudo leer las reglas de LuLu. No se bloqueó nada.')
+    # Aislar un programa nuevo da por bueno lo que estaba en prueba del anterior (David, 2026-10-21).
+    if promover('nuevo aislamiento'):
+        print('  Lo que estaba en prueba del aislamiento anterior quedó aprobado.')
+    ya_bloq = {b['path'] for b in leer('bloqueados.json', [])}
     print(f'  Bloqueando {len(exes)} ejecutable(s)...')
     hechos = bloquear(exes, 'proveedor', reglas)
     recargar()
     hechos = confirmar(hechos)
     escribir('bloqueados.json', fusionar(leer('bloqueados.json', []), hechos))
     zonas = leer('zonas.json', [])
-    escribir('zonas.json', sorted(set(zonas) | {r for r in raices if os.path.isdir(r)}))
+    zonas_nuevas = sorted({r for r in raices if os.path.isdir(r)} - set(zonas))
+    escribir('zonas.json', sorted(set(zonas) | set(zonas_nuevas)))
+    # Solo lo que este aislamiento agregó: 'volver' no debe quitar bloqueos de un estado ya aprobado.
+    anotar_prueba([dict(h, accion='bloqueo') for h in hechos if h['path'] not in ya_bloq] +
+                  [{'accion': 'zona', 'path': z} for z in zonas_nuevas])
     print(f'  {len(hechos)} de {len(exes)} ejecutable(s) quedaron bloqueados (verificado en LuLu).')
     if len(hechos) < len(exes):
         # No se reintentan solos: no quedan en bloqueados.json y la detección salta lo que no cambió.
         print(f'  Los que faltan están en {BASE}/centinela.log. Vuelve a correr "2 Aislar": lo ya bloqueado se salta.')
+    if revisar_despues:
+        # Al instalar un programa aparecen también sus arranques automáticos: se revisan ya, no el lunes.
+        print('  Revisando el equipo para mostrarte los arranques automáticos nuevos (puede tardar)...')
+        de = f' de {", ".join(proveedores)}' if proveedores else ''
+        cmd_detectar(informe_extra=[{'tipo': 'bloqueado', 'texto': f'{len(hechos)} programa(s){de} '
+                                     '(se bloquearon al aislar)'}])
 
 
 def cmd_bloquear(p):
@@ -3723,13 +3983,64 @@ def cmd_proteger_lulu():
 
 
 def cmd_rollback():
+    """Quitar el Centinela por completo: todos los bloqueos y todos los arranques que apagó."""
     bloq = leer('bloqueados.json', [])
     desbloquear(bloq, [])
     if bloq:
         recargar()
-    for nombre, vacio in (('bloqueados.json', []), ('zonas.json', []), ('pendientes.json', []), ('estado.json', {})):
+    apagados = leer('apagados.json', [])
+    for a in apagados:
+        encender_servicio(a)
+    for nombre, vacio in (('bloqueados.json', []), ('zonas.json', []), ('pendientes.json', []), ('estado.json', {}),
+                          ('prueba.json', {}), ('apagados.json', [])):
         escribir(nombre, vacio)
-    print(f'  {len(bloq)} ejecutable(s) desbloqueados.')
+    print(f'  {len(bloq)} ejecutable(s) desbloqueados y {len(apagados)} arranque(s) automático(s) encendidos de nuevo.')
+
+
+def cmd_volver():
+    """Vuelve al último estado aprobado: deshace todo lo que está en prueba (internet y arranques) y
+    vuelve a preguntar los arranques. No desinstala nada."""
+    acciones = leer('prueba.json', {}).get('acciones', [])
+    if not acciones:
+        print('  No hay nada en prueba: el equipo ya está en el último estado aprobado.')
+        return
+    de = lambda tipo: [a for a in acciones if a.get('accion') == tipo]
+
+    # Internet: se quitan los bloqueos de la prueba. Esos ejecutables entran al baseline tal como
+    # están, para que la detección no los reporte como nuevos: es el estado de antes de aislarlos.
+    rutas = {a['path'] for a in de('bloqueo')}
+    bloq = leer('bloqueados.json', [])
+    restantes = [b for b in bloq if b['path'] not in rutas]
+    desbloquear([b for b in bloq if b['path'] in rutas], restantes)
+    recargar()
+    escribir('bloqueados.json', restantes)
+    base = leer('baseline_exes.json', {})
+    for p in rutas:
+        if os.path.isfile(p):
+            st = os.stat(p)
+            base[p] = {'h': sha256(p), 's': st.st_size, 'm': int(st.st_mtime), 't': firma(p)[1]}
+    escribir('baseline_exes.json', base)
+    quitar = {a['path'] for a in de('zona')}
+    escribir('zonas.json', [z for z in leer('zonas.json', []) if z not in quitar])
+
+    # Arranques: se encienden los que se apagaron y se olvida lo que se dio por visto.
+    for a in de('apagado'):
+        encender_servicio(a)
+    labels = {a['label'] for a in de('apagado')}
+    escribir('apagados.json', [a for a in leer('apagados.json', []) if a['label'] not in labels])
+    vistos = {a['firma'] for a in de('visto')}
+    bl = leer('baseline.json', {})
+    bl['persistencia'] = [x for x in bl.get('persistencia', []) if x not in vistos]
+    escribir('baseline.json', bl)
+
+    escribir('prueba.json', {})
+    escribir('pendientes.json', [])
+    msg = (f'{len(rutas)} bloqueo(s) de internet quitados, {len(labels)} arranque(s) encendidos de nuevo, '
+           f'{len(vistos)} anotación(es) de arranque por revisar otra vez')
+    log(f'Volver al último estado aprobado: {msg}.')
+    print(f'  Listo: {msg}.')
+    print('  Revisando el equipo para volver a preguntarte los arranques automáticos...')
+    cmd_detectar(informe_extra=[{'tipo': 'aviso', 'texto': f'Se volvió al último estado aprobado: {msg}.'}])
 
 
 ESPERA_ARRANQUE = 600   # al encender: 10 min para que LuLu y la red levanten (David, 2026-10-16); sin esto sale "LuLu no filtra"
@@ -3744,8 +4055,13 @@ def segundos_encendido():
         return ARRANQUE_RECIENTE + 1
 
 
-def cmd_detectar():
-    # Corre lunes y viernes 13:30 y al encender (RunAtLoad): si coinciden, la segunda no hace nada.
+def cmd_detectar(informe_extra=None):
+    """Lunes y viernes 13:30, al encender, y justo después de "2 Aislar" o de "volver".
+
+    Internet no se pregunta: lo nuevo dentro de una zona aprobada se bloquea solo y se informa; lo
+    nuevo fuera de las zonas solo se informa (si es de un programa que se instaló a propósito, falta
+    su sección en el Centinela). Lo único que se pregunta son los arranques automáticos activos."""
+    # Si coinciden dos (cita y encendido), la segunda no hace nada.
     candado = open(BASE / 'detectar.lock', 'w')
     try:
         fcntl.flock(candado, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -3754,26 +4070,32 @@ def cmd_detectar():
         return
     if segundos_encendido() < ARRANQUE_RECIENTE:
         time.sleep(ESPERA_ARRANQUE)
-    alertas = []
+    alertas, informe = [], list(informe_extra or [])
     salud(alertas)
     if not (BASE / 'baseline.json').exists():
-        alertas.append(alerta('grave', 'No hay baseline: la detección de cambios no corre. '
-                                       'Créalo en EnsambleSetup → Instalación → Aislador + Centinela.'))
+        alertas.append(alerta('grave', 'No hay estado aprobado inicial: la detección de cambios no corre. '
+                                       'Créalo en EnsambleSetup → Instalación → Aislador + Centinela → 1.'))
         guardar_estado(alertas)
         avisar()
         return
+    prueba = leer('prueba.json', {})
+    if prueba.get('desde') and dias_desde(prueba['desde']) >= DIAS_PRUEBA and promover(f'{DIAS_PRUEBA} días'):
+        informe.append({'tipo': 'aviso', 'texto': f'Lo que estaba en prueba desde el {fecha_legible(prueba["desde"])} '
+                                                  f'quedó aprobado ({DIAS_PRUEBA} días sin instalar nada nuevo).'})
     bl = leer('baseline.json', {})
     base = leer('baseline_exes.json', {})
     wl = {w['path'] for w in leer('whitelist.json', [])}
     zonas = leer('zonas.json', [])
     bloq = leer('bloqueados.json', [])
     bloq_set = {b['path'] for b in bloq}
-    pend = leer('pendientes.json', [])
-    ids = {x['id'] for x in pend}
+    # Solo quedan pendientes los arranques por decidir. Lo del formato anterior (programas por elegir)
+    # se descarta y se vuelve a evaluar abajo con las reglas de ahora.
+    pend = [x for x in leer('pendientes.json', []) if x.get('tipo') == 'ARRANQUE']
+    por_clave = {x['clave']: x for x in pend}
     reglas = leer_reglas() if extension_activa() else None
     raices = vigiladas()
     equipos = equipos_por_app(base, raices)
-    nuevos_bloq, nuevos, n_pers, aceptados, base_cambio = [], [], 0, 0, False
+    nuevos_bloq, fuera, aceptados, base_cambio, bl_cambio, acciones = [], [], 0, False, False, []
 
     for p, st in escanear(raices).items():
         if p in bloq_set:
@@ -3785,66 +4107,91 @@ def cmd_detectar():
         h = sha256(p)
         if b is not None and (not h or h == b['h']):
             continue
-        tipo = 'NUEVO' if b is None else 'MODIFICADO'
-        id_ = f'{tipo}|{p}'
-        if id_ in ids:
-            continue
-        zona = en_zona(p, zonas)
-        if not zona:
-            # Fuera de zona no se pregunta por el sistema (Apple), la App Store, ni lo firmado por el
-            # mismo desarrollador que ya tenía esa app en el baseline: son actualizaciones.
-            t, team = firma(p)
-            if t in ('apple', 'appstore') or (t == 'devid' and team in equipos.get(app_de(p, raices), ())):
-                base[p] = {'h': h, 's': st.st_size, 'm': int(st.st_mtime), 't': team}
-                base_cambio = True
-                if t == 'devid':
-                    aceptados += 1
-                    log(f'Aceptado por firmante {team}: {p}')
-                continue
-        prov = False
-        if zona and p not in wl and reglas is not None:
-            hechos = bloquear([p], 'provisional', reglas)
+        tipo = 'nuevo' if b is None else 'modificado'
+        if en_zona(p, zonas) and p not in wl:
+            hechos = bloquear([p], 'provisional', reglas) if reglas is not None else []
             if hechos:
-                prov = True
                 nuevos_bloq += hechos
                 bloq_set.add(p)
-        x = {'id': id_, 'tipo': tipo, 'path': p, 'detalle': '', 'sha256': h,
-             'en_zona': zona, 'provisional': prov, 'fecha': ahora()}
-        pend.append(x)
-        nuevos.append(x)
-        ids.add(id_)
+                continue
+            # Sin bloqueo no entra al baseline: la próxima detección lo vuelve a intentar.
+            informe.append({'tipo': 'no_bloqueado', 'texto': f'Programa {tipo} que no se pudo bloquear: {p}'})
+            continue
+        t, team = firma(p)
+        # Fuera de zona no se informa lo del sistema (Apple), la App Store, ni lo firmado por el mismo
+        # desarrollador que ya tenía esa app en el baseline: son actualizaciones.
+        actualizacion = t in ('apple', 'appstore') or (t == 'devid' and team in equipos.get(app_de(p, raices), ()))
+        if actualizacion and t == 'devid':
+            aceptados += 1
+            log(f'Aceptado por firmante {team}: {p}')
+        elif not actualizacion:
+            fuera.append(f'Programa {tipo}: {p}')
+            log(f'Programa {tipo} fuera de los proveedores del Centinela: {p}')
+        base[p] = {'h': h, 's': st.st_size, 'm': int(st.st_mtime), 't': team}
+        base_cambio = True
 
     base_pers = set(bl.get('persistencia', []))
     fallas = []
-    for x in persistencia(fallas):
-        id_ = 'PERSISTENCIA|' + x
-        if x in base_pers or id_ in ids:
+    actuales = persistencia(fallas)
+    if not fallas:
+        # Lo pendiente que ya no existe (se desinstaló antes de decidir) deja de preguntarse.
+        vigentes = set(actuales)
+        for x in pend:
+            x['firmas'] = [f for f in x.get('firmas', []) if f in vigentes]
+        pend = [x for x in pend if x['firmas']]
+    ya_pend = {f for x in pend for f in x.get('firmas', [])}
+    avisos, n_pers = {}, 0
+    for x in actuales:
+        if x in base_pers or x in ya_pend:
             continue
-        pend.append({'id': id_, 'tipo': 'PERSISTENCIA', 'path': exe_de_plist(x), 'detalle': x.split('|')[1],
-                     'firma': x, 'sha256': '', 'en_zona': False, 'provisional': False, 'fecha': ahora()})
-        ids.add(id_)
         n_pers += 1
+        a = arranque_de(x)
+        if a and a['activo'] and (a['clase'] == 'app' or a.get('dominios')):
+            if a['clave'] in por_clave:
+                por_clave[a['clave']]['firmas'].append(x)
+            else:
+                item = dict(a, id='ARRANQUE|' + a['clave'], tipo='ARRANQUE', firmas=[x], fecha=ahora())
+                pend.append(item)
+                por_clave[a['clave']] = item
+            continue
+        # Lo demás es solo aviso: queda visto (en prueba) y se informa una vez.
+        bl.setdefault('persistencia', []).append(x)
+        bl_cambio = True
+        acciones.append({'accion': 'visto', 'firma': x})
+        if a:
+            como = {'apagado': 'ya está apagado, no arranca solo',
+                    'a pedido': 'solo corre cuando un programa lo llama, no al encender'}.get(a['estado'], a['estado'])
+            avisos.setdefault(a['clave'], f'Arranque automático de {a["nombre"]}: {como}')
+        else:
+            avisos.setdefault(x, x.split('|')[1])
     if fallas:
         alertas.append(alerta('grave', f'No se pudo revisar: {", ".join(fallas)}. Lo que arranque solo por esa '
                                        'vía no se está vigilando. Ver centinela.log.'))
 
     if nuevos_bloq:
         recargar()
-        puestos = {h['path'] for h in confirmar(nuevos_bloq)}
-        for x in nuevos:
-            if x['provisional'] and x['path'] not in puestos:
-                x['provisional'] = False
+        confirmados = confirmar(nuevos_bloq)
+        puestos = {h['path'] for h in confirmados}
+        for h in nuevos_bloq:
+            if h['path'] not in puestos:
+                informe.append({'tipo': 'no_bloqueado', 'texto': f'Programa nuevo que no se pudo bloquear: {h["path"]}'})
         if len(puestos) < len(nuevos_bloq):
-            alertas.append(alerta('grave', f'No se pudieron bloquear provisionalmente {len(nuevos_bloq) - len(puestos)} '
-                                           'ejecutable(s) nuevo(s) en zona aprobada. Ver centinela.log.'))
-        nuevos_bloq = [h for h in nuevos_bloq if h['path'] in puestos]
-        escribir('bloqueados.json', fusionar(bloq, nuevos_bloq))
+            alertas.append(alerta('grave', f'No se pudieron bloquear {len(nuevos_bloq) - len(puestos)} ejecutable(s) '
+                                           'nuevo(s) de un proveedor aislado. Ver centinela.log.'))
+        escribir('bloqueados.json', fusionar(bloq, confirmados))
+        acciones += [dict(h, accion='bloqueo') for h in confirmados]
+        informe += [{'tipo': 'bloqueado', 'texto': h['path']} for h in confirmados]
+    informe += [{'tipo': 'fuera', 'texto': t} for t in fuera]
+    informe += [{'tipo': 'aviso', 'texto': t} for t in avisos.values()]
     if base_cambio:
         escribir('baseline_exes.json', base)
+    if bl_cambio:
+        escribir('baseline.json', bl)
+    anotar_prueba(acciones)
     escribir('pendientes.json', pend)
-    guardar_estado(alertas)
-    log(f'Detección: {len(nuevos) + n_pers} nuevo(s), {len(nuevos_bloq)} bloqueado(s) provisionalmente, '
-        f'{aceptados} aceptado(s) por firmante, {len(pend)} pendiente(s).')
+    guardar_estado(alertas, informe)
+    log(f'Detección: {len(nuevos_bloq)} bloqueado(s), {len(fuera)} fuera de los proveedores, {aceptados} aceptado(s) '
+        f'por firmante, {n_pers} entrada(s) de arranque nueva(s), {len(pend)} arranque(s) por decidir.')
     avisar()   # siempre: si un lunes no sale ni la alerta ni el "todo en orden", el Centinela se cayó (R4)
 
 
@@ -3885,50 +4232,40 @@ def avisar():
 
 
 def cmd_aplicar(huella, lista):
+    """La decisión de la ventana: los números elegidos se APAGAN, lo demás sigue arrancando solo.
+    Todo queda en prueba. Un servicio que no se pudo apagar sigue pendiente y se vuelve a preguntar."""
     if sha256(BASE / 'pendientes.json') != huella:
         sys.exit('La lista cambió mientras la revisabas (corrió una detección). Vuelve a abrirse en el próximo aviso.')
     pend = leer('pendientes.json', [])
     elegidos = set() if lista == 'ninguno' else {int(n) - 1 for n in lista.split(',') if n.strip().isdigit()}
-    bloq = leer('bloqueados.json', [])
-    wl = leer('whitelist.json', [])
     bl = leer('baseline.json', {})
-    base = leer('baseline_exes.json', {})
-    reglas = leer_reglas() or (set(), set(), set())
-    a_desbloquear, nuevos = [], []
-
+    apagados = leer('apagados.json', [])
+    acciones, quedan, n_apagados, a_mano, fallidos = [], [], 0, [], []
     for i, x in enumerate(pend):
-        p = x.get('path') or ''
-        if i in elegidos:
-            if p and os.path.exists(p):
-                nuevos += bloquear([p], 'centinela', reglas)
-                wl = [w for w in wl if w['path'] != p]
-        elif p and x['tipo'] != 'PERSISTENCIA':
-            if x.get('provisional'):
-                a_desbloquear += [b for b in bloq if b['path'] == p]
-            bloq = [b for b in bloq if b['path'] != p]
-            wl = [w for w in wl if w['path'] != p] + [{'path': p, 'sha256': x.get('sha256', ''), 'fecha': ahora()}]
-        if x['tipo'] == 'PERSISTENCIA':
-            bl.setdefault('persistencia', []).append(x.get('firma') or x.get('detalle'))
-        elif p and os.path.exists(p):
-            st = os.stat(p)
-            base[p] = {'h': x.get('sha256') or sha256(p), 's': st.st_size, 'm': int(st.st_mtime), 't': firma(p)[1]}
-
-    if a_desbloquear:
-        desbloquear(a_desbloquear, bloq + nuevos)
-    recargar()
-    confirmados = confirmar(nuevos)
-    if len(confirmados) < len(nuevos):
-        log(f'Revisión: {len(nuevos) - len(confirmados)} elegido(s) no quedaron bloqueados en LuLu.')
-    bloq = fusionar(bloq, confirmados)
-    escribir('bloqueados.json', bloq)
-    escribir('whitelist.json', wl)
+        if i in elegidos and x['clase'] == 'servicio':
+            if not apagar_servicio(x):
+                fallidos.append(x['nombre'])
+                quedan.append(x)
+                continue
+            a = {'accion': 'apagado', 'label': x['label'], 'dominios': x['dominios'], 'plist': x['plist'],
+                 'nombre': x['nombre'], 'fecha': ahora()}
+            acciones.append(a)
+            apagados = [y for y in apagados if y['label'] != x['label']] + [a]
+            n_apagados += 1
+        elif i in elegidos:
+            a_mano.append(x['nombre'])   # ítem de inicio de una app: macOS no deja apagarlo por comando
+        for f in x.get('firmas', []):
+            bl.setdefault('persistencia', []).append(f)
+            acciones.append({'accion': 'visto', 'firma': f})
     escribir('baseline.json', bl)
-    escribir('baseline_exes.json', base)
-    escribir('pendientes.json', [])
-    est = leer('estado.json', {})
-    escribir('estado.json', {'fecha': est.get('fecha', ahora()),
-                             'alertas': [a for a in est.get('alertas', []) if a.get('nivel') == 'grave']})
-    log(f'Revisión: {len(elegidos)} bloqueado(s), {len(pend) - len(elegidos)} a whitelist.')
+    escribir('apagados.json', apagados)
+    anotar_prueba(acciones)
+    escribir('pendientes.json', quedan)
+    siguen = len(pend) - len(elegidos & set(range(len(pend))))
+    log(f'Revisión: {n_apagados} arranque(s) apagado(s), {len(a_mano)} para apagar a mano, '
+        f'{siguen} siguen arrancando solos, {len(fallidos)} no se pudieron apagar.')
+    if fallidos:
+        print('No se pudieron apagar y siguen pendientes: ' + ', '.join(fallidos) + '.')
 
 
 # ─── Pantalla (corre como el usuario de la sesión) ───
@@ -3941,11 +4278,69 @@ def as_texto(s):
     return '"' + s.replace('\\', '\\\\').replace('"', '\\"') + '"'
 
 
+# 2026-10-21: la alerta lanzada por el LaunchAgent se cerró sola cuando David hizo clic en VS Code,
+# sin que nadie la respondiera (lanzada desde Terminal, la misma alerta no se cierra). Una ventana del
+# Centinela no se da por respondida hasta que alguien presiona un botón: si se cierra sin respuesta o
+# nadie responde en REAPARECER s, vuelve a salir al frente, hasta INTENTOS_VENTANA veces.
+REAPARECER = 300
+INTENTOS_VENTANA = 12
+
+
+def log_ventana(m):
+    """Log del usuario: 'revisar' no corre como root y no puede escribir centinela.log."""
+    try:
+        p = Path.home() / 'Library/Application Support/EnsambleSetup/centinela_ventanas.log'
+        p.parent.mkdir(parents=True, exist_ok=True)
+        with open(p, 'a', encoding='utf-8') as f:
+            f.write(f'{ahora()} {m}\n')
+    except OSError:
+        pass
+
+
+def ventana(script):
+    """Corre `script` (que devuelve un texto, o "SE_RINDIO" si nadie respondió a tiempo) hasta que
+    haya respuesta. None = nunca hubo respuesta, o se eligió Cancelar en un 'display dialog'."""
+    for intento in range(1, INTENTOS_VENTANA + 1):
+        r = osa(f'activate\nwith timeout of {REAPARECER * 2} seconds\n{script}\nend timeout\n')
+        salida = r.stdout.strip()
+        if r.returncode == 0 and salida != 'SE_RINDIO':
+            return salida
+        if '(-128)' in r.stderr:   # botón Cancelar: es una respuesta
+            return None
+        log_ventana(f'Ventana sin respuesta (intento {intento}): código {r.returncode} · '
+                    f'{(r.stderr or salida).strip()[:200]}')
+    return None
+
+
+def alerta_simple(texto, critica=False, botones=('OK',), copiar=None):
+    """Alerta que no se pierde. Devuelve el botón presionado, o None si nunca hubo respuesta."""
+    b = ', '.join(as_texto(x) for x in botones)
+    titulo, _, cuerpo = texto.partition('\n') if critica else (TITULO, '', texto)
+    script = (f'set res to display alert {as_texto(titulo)} message {as_texto(cuerpo.strip())}'
+              f'{" as critical" if critica else ""} buttons {{{b}}} default button {as_texto(botones[-1])} '
+              f'giving up after {REAPARECER}\n'
+              'if gave up of res then return "SE_RINDIO"\n'
+              'set boton to button returned of res\n')
+    if copiar is not None:
+        script += f'if boton is "Copiar mensaje" then set the clipboard to {as_texto(copiar)}\n'
+    return ventana(script + 'return boton')
+
+
 ENCABEZADO_ALERTA = '⚠️ Alerta de infiltración web — Centinela Ensamble'
 PIE_ALERTA = 'Copia este mensaje y envíalo por Telegram a David o a Sebastián.'
-TIPOS_LEGIBLES = {'NUEVO': 'Programa nuevo', 'MODIFICADO': 'Programa modificado',
-                  'PERSISTENCIA': 'Arranque automático nuevo'}
+SECCIONES_INFORME = (
+    ('bloqueado', 'Quedó sin internet:'),
+    ('no_bloqueado', 'Es de un proveedor aislado, pero NO se pudo bloquear:'),
+    ('fuera', 'Apareció fuera de los proveedores del Centinela (si lo instalaste tú, avísale a /asesor-ti '
+              'para agregarle su sección):'),
+    ('aviso', 'Solo aviso, no hay nada que decidir:'),
+)
 MAX_ITEMS_ALERTA = 12
+MARCAS_LICENCIA = {'licencia': '[LICENCIA: si lo apagas, el programa puede no abrir]',
+                   'posible': '[POSIBLE LICENCIA: puede hacer falta para que el programa abra]'}
+PASOS_A_MANO = ('Ajustes del Sistema → General → Ítems de inicio y extensiones → en «Permitir en segundo plano» '
+                'apaga el interruptor de cada uno. Si aparece en «Abrir al iniciar sesión», selecciónalo y '
+                'quítalo con el botón «−».')
 
 
 def fecha_legible(iso):
@@ -3960,31 +4355,35 @@ def nombre_equipo():
     return r.stdout.strip() or os.uname().nodename
 
 
-def mensaje_infiltracion(est, graves, pend):
+def recortar(lineas):
+    extra = len(lineas) - MAX_ITEMS_ALERTA
+    return lineas[:MAX_ITEMS_ALERTA] + ([f'• … y {extra} más'] if extra > 0 else [])
+
+
+def marca(x):
+    m = MARCAS_LICENCIA.get(x.get('licencia'), '')
+    return f'  {m}' if m else ''
+
+
+def mensaje_infiltracion(est, graves, informe, pend):
     lineas = [ENCABEZADO_ALERTA, f'Equipo: {nombre_equipo()} · {fecha_legible(est.get("fecha"))}', '']
+    for tipo, titulo in SECCIONES_INFORME:
+        de = [f"• {i['texto']}" for i in informe if i.get('tipo') == tipo]
+        if de:
+            lineas += [titulo] + recortar(de) + ['']
     if pend:
-        lineas.append('Apareció:')
-        for x in pend[:MAX_ITEMS_ALERTA]:
-            ya = ' (ya bloqueado)' if x.get('provisional') else ''
-            lineas.append(f"• {TIPOS_LEGIBLES.get(x['tipo'], x['tipo'])}{ya}: {x.get('path') or x.get('detalle')}")
-        if len(pend) > MAX_ITEMS_ALERTA:
-            lineas.append(f'• … y {len(pend) - MAX_ITEMS_ALERTA} más')
-        lineas.append('')
+        lineas.append('Arranques automáticos nuevos, para decidir en la ventana siguiente:')
+        lineas += recortar([f"• {x['nombre']} ({x['detalle']}){marca(x)}" for x in pend]) + ['']
     if graves:
-        lineas.append('Además:')
-        lineas += [f"• {a['texto']}" for a in graves]
-        lineas.append('')
+        lineas += ['Además:'] + [f"• {a['texto']}" for a in graves] + ['']
     lineas.append(PIE_ALERTA)
     return '\n'.join(lineas)
 
 
-def alerta_infiltracion(est, graves, pend):
+def alerta_infiltracion(est, graves, informe, pend):
     """Ventana con el mensaje y un botón que lo deja en el portapapeles, listo para Telegram."""
-    texto = mensaje_infiltracion(est, graves, pend)
-    titulo, cuerpo = texto.split('\n', 1)
-    osa(f'set r to button returned of (display alert {as_texto(titulo)} message {as_texto(cuerpo.strip())} '
-        'as critical buttons {"Cerrar", "Copiar mensaje"} default button "Copiar mensaje")\n'
-        f'if r is "Copiar mensaje" then set the clipboard to {as_texto(texto)}\n')
+    texto = mensaje_infiltracion(est, graves, informe, pend)
+    return alerta_simple(texto, critica=True, botones=('Cerrar', 'Copiar mensaje'), copiar=texto)
 
 
 def cmd_revisar():
@@ -3998,36 +4397,39 @@ def cmd_revisar():
     alertas = [a for a in est.get('alertas', []) if a]
     graves = [a for a in alertas if a.get('nivel') == 'grave']
     infos = [a for a in alertas if a.get('nivel') != 'grave']
-    pend = leer('pendientes.json', [])
+    pend = [x for x in leer('pendientes.json', []) if x.get('tipo') == 'ARRANQUE']
 
     # Cada detección se anuncia una vez, haya o no hallazgos: que un lunes no salga nada es la señal de
-    # que el Centinela se cayó (R4). Lo grave y lo pendiente se repiten hasta que se resuelve.
+    # que el Centinela se cayó (R4). Lo grave y los arranques por decidir se repiten hasta resolverse;
+    # el informe (lo que ya pasó) sale una sola vez.
     visto = Path.home() / 'Library/Application Support/EnsambleSetup/centinela_visto.txt'
     ya_visto = visto.exists() and visto.read_text().strip() == est.get('fecha', '')
-    mostrado = False
-    if graves or pend:
-        alerta_infiltracion(est, graves, pend)
-        mostrado = True
+    informe = [] if ya_visto else est.get('informe', [])
+    # Visto solo si alguien respondió: una ventana que nunca se contestó vuelve al iniciar sesión.
+    respondido = None
+    if graves or pend or informe:
+        respondido = alerta_infiltracion(est, graves, informe, pend)
+        if respondido is None:
+            return   # lo por decidir tampoco se muestra: no hay nadie mirando
     if infos and not ya_visto:
-        osa(f'display alert {as_texto(TITULO)} message {as_texto(chr(10).join(a["texto"] for a in infos))}')
-        mostrado = True
-    if not mostrado and not ya_visto and est.get('fecha'):
-        osa(f'display alert {as_texto(TITULO)} message '
-            f'{as_texto("Revisión del " + fecha_legible(est["fecha"]) + " hecha: todo en orden.")}')
-        mostrado = True
-    if mostrado:
+        respondido = alerta_simple(chr(10).join(a['texto'] for a in infos))
+    if respondido is None and not ya_visto and est.get('fecha') and not (graves or pend or informe or infos):
+        respondido = alerta_simple(f'Revisión del {fecha_legible(est["fecha"])} hecha: todo en orden.')
+    if respondido is not None:
         visto.parent.mkdir(parents=True, exist_ok=True)
         visto.write_text(est.get('fecha', ''))
-    if not pend:
-        return
+    if pend:
+        decidir_arranques(pend)
 
+
+def decidir_arranques(pend):
     huella = sha256(BASE / 'pendientes.json')
-    items = []
-    for i, x in enumerate(pend, 1):
-        marca = '  [bloqueado provisionalmente]' if x.get('provisional') else ('  [zona aprobada]' if x.get('en_zona') else '')
-        items.append(f"{i}. {x['tipo']} · {x.get('path') or x.get('detalle')}{marca}")
-    prompt = ('Elige lo que queda BLOQUEADO (Cmd+clic para varios). Lo que no elijas pasa a la whitelist y '
-              'recupera la red. «Decidir después» deja todo pendiente.')
+    items = [f"{i}. {x['nombre']} · "
+             f"{'lo apaga el Centinela' if x['clase'] == 'servicio' else 'se apaga a mano, te muestro cómo'}{marca(x)}"
+             for i, x in enumerate(pend, 1)]
+    prompt = ('Estos programas arrancan solos al encender el equipo. Elige los que quieres APAGAR (Cmd+clic para '
+              'varios). Lo que no elijas sigue arrancando solo. Todo queda en prueba: si algo deja de funcionar, '
+              '«Volver al último estado aprobado» lo deshace. «Decidir después» no cambia nada.')
     script = (
         f'set sel to choose from list {{{", ".join(as_texto(s) for s in items)}}} with title {as_texto(TITULO)} '
         f'with prompt {as_texto(prompt)} OK button name "Aplicar" cancel button name "Decidir después" '
@@ -4039,22 +4441,27 @@ def cmd_revisar():
         'end repeat\n'
         'return salida\n'
     )
-    r = osa(script)
-    salida = r.stdout.strip()
-    if r.returncode != 0 or salida == 'CANCELAR':
+    salida = ventana(script)
+    if salida is None or salida == 'CANCELAR':
         return
-    elegidos = sorted({int(n) for n in salida.split(',') if n.strip().isdigit()})
-    n_b = len(elegidos)
-    r = osa(f'display dialog {as_texto(f"Se bloquean {n_b}; pasan a whitelist {len(pend) - n_b}. ¿Confirmas?")} '
-            f'with title {as_texto(TITULO)} buttons {{"Cancelar", "Confirmar"}} default button "Confirmar"')
-    if r.returncode != 0:
+    elegidos = sorted({int(n) for n in salida.split(',') if n.strip().isdigit() and 0 < int(n) <= len(pend)})
+    n = len(elegidos)
+    if alerta_simple(f'Se apagan {n}; siguen arrancando solos {len(pend) - n}. ¿Confirmas?',
+                     botones=('Cancelar', 'Confirmar')) != 'Confirmar':
         return
     cmd = ' '.join(shlex.quote(a) for a in (sys.executable, str(Path(__file__).resolve()), 'aplicar', huella,
                                             ','.join(map(str, elegidos)) or 'ninguno'))
     r = osa(f'do shell script {as_texto(cmd)} with administrator privileges')
     if r.returncode != 0:
         motivo = (r.stderr or r.stdout).strip() or 'se canceló la contraseña'
-        osa(f'display alert {as_texto(TITULO)} message {as_texto("No se aplicó: " + motivo + ". La lista sigue pendiente.")}')
+        alerta_simple(f'No se aplicó: {motivo}. La lista sigue pendiente.')
+        return
+    a_mano = [pend[i - 1]['nombre'] for i in elegidos if pend[i - 1]['clase'] == 'app']
+    partes = [r.stdout.strip()] if r.stdout.strip() else []
+    if a_mano:
+        partes.append(f'Estos los apagas tú: {", ".join(a_mano)}.\n\n{PASOS_A_MANO}')
+    if partes:
+        alerta_simple(chr(10).join(partes))
 
 
 if __name__ == '__main__':
@@ -4069,7 +4476,7 @@ if __name__ == '__main__':
     if cmd == 'baseline':
         cmd_baseline()
     elif cmd == 'aislar' and len(args) >= 2:
-        cmd_aislar(args[1], '--real' in args)
+        cmd_aislar(args[1], '--real' in args, '--aceptar-choques' in args)
     elif cmd == 'detectar':
         cmd_detectar()
     elif cmd == 'aplicar' and len(args) == 3:
@@ -4080,6 +4487,8 @@ if __name__ == '__main__':
         cmd_whitelist_add(args[1])
     elif cmd == 'proteger-lulu':
         cmd_proteger_lulu()
+    elif cmd == 'volver':
+        cmd_volver()
     elif cmd == 'rollback':
         cmd_rollback()
     else:
