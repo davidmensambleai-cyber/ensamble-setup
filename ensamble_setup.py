@@ -1677,11 +1677,57 @@ def _mac_herramientas_documentos():
         ok(f"{', '.join(faltan)} instalado(s).")
 
 
+# Rosetta 2. AutoCAD y Archicad de la oficina son versiones Intel (decisión de compra de David,
+# 2026-10-21): en un Mac con chip de Apple no abren sin Rosetta. No tiene versiones propias: llega y
+# se actualiza con macOS, así que "la mejor Rosetta" = macOS al día. Apple la mantiene para uso
+# general hasta macOS 27; en macOS 28 (otoño 2027) queda solo para juegos viejos. Según AppleInsider
+# (2026-06-12, sin confirmar con Apple), instalar macOS 27 la quita y hay que reinstalarla: por eso se
+# revisa en cada corrida. Fuentes en protocolo-centinela-mac.md → "Rosetta".
+ROSETTA_PKG = 'com.apple.pkg.RosettaUpdateAuto'
+MACOS_REFERENCIA = '26.4'          # el del Mac mini de oficina (ENS-MAC-DSK-01), 2026-10-21
+MACOS_ULTIMO_CON_ROSETTA = 27
+
+
+def _version_tupla(v: str) -> tuple:
+    return tuple(int(x) for x in v.split('.') if x.isdigit())
+
+
+def _mac_rosetta():
+    if platform.machine() != 'arm64':
+        info("Mac con procesador Intel: los programas Intel corren directo, no necesita Rosetta.")
+        return
+    tiene = lambda: subprocess.run(['pkgutil', '--pkg-info', ROSETTA_PKG], capture_output=True).returncode == 0
+    if tiene():
+        ok("Rosetta 2 instalada.")
+    else:
+        warn("Rosetta 2 NO está instalada: AutoCAD y Archicad (versiones Intel) no abren sin ella.")
+        if confirm("¿Instalarla ahora?"):
+            run_logged(['softwareupdate', '--install-rosetta', '--agree-to-license'], 'Instalar Rosetta 2')
+            if tiene():
+                ok("Rosetta 2 instalada (verificado).")
+            else:
+                err("Rosetta 2 sigue sin aparecer. Revisa la conexión a internet y vuelve a correr esta sección.")
+    # sw_vers y no platform.mac_ver(): el Python de las Command Line Tools puede responder '10.16'.
+    version = subprocess.run(['sw_vers', '-productVersion'], capture_output=True, text=True).stdout.strip()
+    if not version:
+        return
+    info(f"macOS {version}. Rosetta se actualiza con macOS.")
+    if _version_tupla(version) < _version_tupla(MACOS_REFERENCIA):
+        warn(f"macOS atrasado (la referencia de la oficina es {MACOS_REFERENCIA}): este equipo tiene una Rosetta vieja.")
+        info("  Actualiza en Ajustes del Sistema → General → Actualización de software.")
+    if _version_tupla(version)[:1] >= (MACOS_ULTIMO_CON_ROSETTA,):
+        warn(f"macOS {MACOS_ULTIMO_CON_ROSETTA} es el último con Rosetta para uso general. En macOS "
+             f"{MACOS_ULTIMO_CON_ROSETTA + 1} AutoCAD y Archicad Intel dejarían de abrir:")
+        warn("  NO actualizar a esa versión sin haber pasado antes a las versiones para chip de Apple.")
+
+
 def seccion_software_basico():
     title("INSTALACIÓN · SOFTWARE BÁSICO")
     vscode = _es_usuario_vscode()
 
     if IS_MAC:
+        print("\n  ─ Rosetta 2 (AutoCAD y Archicad son versiones Intel) ─")
+        _mac_rosetta()
         print("\n  ─ LuLu + lulu-cli ─")
         _mac_lulu()
         print("\n  ─ Herramientas de documentos (pandoc, pango) ─")
@@ -2221,6 +2267,7 @@ PERFILES_AISLAR_MAC: dict = {**VENDORS, **AISLAR_EXTRA_MAC}
 # 2026-10-19). Las dos últimas rutas no salen en la documentación: si no existen, no encuentran nada.
 LICENCIAS_COMPARTIDAS_MAC = [
     '/Applications/CodeMeter*',
+    '/Applications/WIBUKEY',   # licencias viejas de Wibu; las instala Archicad 28 (2026-10-21)
     '/Library/Application Support/CodeMeter',
     '/Library/PrivilegedHelperTools/com.wibu.*',
     '/usr/local/bin/cmu',
@@ -3217,7 +3264,27 @@ def vigiladas():
 
 
 def en_zona(p, zonas):
-    return any(p == z or p.startswith(z.rstrip('/') + '/') for z in zonas)
+    # Sin distinguir mayúsculas: el disco del Mac no las distingue, y una zona guardada como
+    # GRAPHISOFT debe cubrir lo que el escaneo encuentra en Graphisoft (2026-10-21).
+    p = p.lower()
+    return any(p == z.lower() or p.startswith(z.lower().rstrip('/') + '/') for z in zonas)
+
+
+def ruta_real(p):
+    """p con el nombre que tiene cada carpeta en el disco. El disco del Mac no distingue mayúsculas:
+    glob devuelve '/Applications/GRAPHISOFT' tal como se escribió aunque la carpeta se llame
+    'Graphisoft', y la misma carpeta entraba dos veces con dos nombres. Si no existe, p tal cual."""
+    actual = '/'
+    for parte in p.strip('/').split('/'):
+        try:
+            nombres = os.listdir(actual)
+        except OSError:
+            return p
+        exacto = parte if parte in nombres else next((n for n in nombres if n.lower() == parte.lower()), None)
+        if exacto is None:
+            return p
+        actual = os.path.join(actual, exacto)
+    return actual
 
 
 # ─── Ejecutables Mach-O ───
@@ -3888,7 +3955,7 @@ def cmd_aislar(archivo, real, aceptar_choques=False, revisar_despues=True):
     # El menú manda {'patrones', 'proveedores'}; una lista sola es el formato anterior.
     patrones = solicitud if isinstance(solicitud, list) else solicitud.get('patrones', [])
     proveedores = [] if isinstance(solicitud, list) else solicitud.get('proveedores', [])
-    raices = sorted({p for pat in patrones for p in glob.glob(pat)})
+    raices = sorted({ruta_real(p) for pat in patrones for p in glob.glob(pat)})
     wl = {w['path'] for w in leer('whitelist.json', [])}
     exes = sorted(p for p in escanear(raices) if p not in wl)
     ya = {b['path'] for b in leer('bloqueados.json', [])}
@@ -3911,6 +3978,7 @@ def cmd_aislar(archivo, real, aceptar_choques=False, revisar_despues=True):
     reglas = leer_reglas()
     if reglas is None:
         sys.exit('  lulu-cli no pudo leer las reglas de LuLu. No se bloqueó nada.')
+    normalizar_rutas()
     # Aislar un programa nuevo da por bueno lo que estaba en prueba del anterior (David, 2026-10-21).
     if promover('nuevo aislamiento'):
         print('  Lo que estaba en prueba del aislamiento anterior quedó aprobado.')
@@ -3934,8 +4002,9 @@ def cmd_aislar(archivo, real, aceptar_choques=False, revisar_despues=True):
         # Al instalar un programa aparecen también sus arranques automáticos: se revisan ya, no el lunes.
         print('  Revisando el equipo para mostrarte los arranques automáticos nuevos (puede tardar)...')
         de = f' de {", ".join(proveedores)}' if proveedores else ''
-        cmd_detectar(informe_extra=[{'tipo': 'bloqueado', 'texto': f'{len(hechos)} programa(s){de} '
-                                     '(se bloquearon al aislar)'}])
+        n_nuevos = sum(1 for h in hechos if h['path'] not in ya_bloq)
+        cmd_detectar(informe_extra=[{'tipo': 'bloqueado', 'texto': f'{len(hechos)} programa(s){de}, {n_nuevos} '
+                                     'nuevo(s) en este aislamiento (los demás ya estaban bloqueados)'}])
 
 
 def cmd_bloquear(p):
@@ -3980,6 +4049,53 @@ def cmd_proteger_lulu():
     escribir('bloqueados.json', fusionar(leer('bloqueados.json', []), hechos))
     print('  LuLu queda sin acceso a internet (no se puede actualizar solo).' if hechos
           else '  No se pudo crear la regla (ver centinela.log).')
+
+
+def normalizar_rutas():
+    """Deja una sola entrada por ejecutable y por zona, con el nombre real del disco. Limpia los
+    duplicados GRAPHISOFT/Graphisoft del aislamiento de Archicad (2026-10-21, 28 ejecutables).
+
+    De un duplicado solo se borra la regla de LuLu por esa ruta mal escrita, que nunca coincide
+    con nada. NUNCA socketfilterfw --unblockapp: el disco no distingue mayúsculas y desbloquearía
+    el programa real. La regla por firma la comparte con la entrada buena y se queda."""
+    bloq = leer('bloqueados.json', [])
+    por_ruta = {}
+    for b in bloq:
+        por_ruta.setdefault(ruta_real(b['path']).lower(), []).append(b)
+    quedan, sobrantes = [], []
+    for grupo in por_ruta.values():
+        real = ruta_real(grupo[0]['path'])
+        bueno = next((b for b in grupo if b['path'] == real), grupo[0])
+        quedan.append(bueno)
+        sobrantes += [b for b in grupo if b is not bueno]
+    for b in sobrantes:
+        for k in b.get('claves', []):
+            if k == b['path'] and k != ruta_real(k):
+                lulu('delete-match', '--key', k, '--action', 'block', '--addr', '*', '--port', '*')
+    zonas = leer('zonas.json', [])
+    zonas_ok = sorted({ruta_real(z) for z in zonas})
+    if not sobrantes and zonas_ok == sorted(zonas):
+        return 0
+    escribir('bloqueados.json', quedan)
+    escribir('zonas.json', zonas_ok)
+    p = leer('prueba.json', {})
+    if p.get('acciones'):
+        rutas_fuera = {b['path'] for b in sobrantes}   # fusionar() no deja dos entradas con la misma ruta
+        vistas, acciones = set(), []
+        for a in p['acciones']:
+            if a.get('accion') == 'bloqueo' and a['path'] in rutas_fuera:
+                continue
+            if a.get('accion') == 'zona':
+                a = dict(a, path=ruta_real(a['path']))
+                if a['path'] in vistas:
+                    continue
+                vistas.add(a['path'])
+            acciones.append(a)
+        p['acciones'] = acciones
+        escribir('prueba.json', p)
+    log(f'Rutas normalizadas: {len(sobrantes)} bloqueo(s) duplicado(s) por mayúsculas quitados, '
+        f'{len(zonas) - len(zonas_ok)} zona(s) duplicada(s).')
+    return len(sobrantes)
 
 
 def cmd_rollback():
@@ -4082,6 +4198,8 @@ def cmd_detectar(informe_extra=None):
     if prueba.get('desde') and dias_desde(prueba['desde']) >= DIAS_PRUEBA and promover(f'{DIAS_PRUEBA} días'):
         informe.append({'tipo': 'aviso', 'texto': f'Lo que estaba en prueba desde el {fecha_legible(prueba["desde"])} '
                                                   f'quedó aprobado ({DIAS_PRUEBA} días sin instalar nada nuevo).'})
+    if normalizar_rutas():
+        recargar()
     bl = leer('baseline.json', {})
     base = leer('baseline_exes.json', {})
     wl = {w['path'] for w in leer('whitelist.json', [])}
