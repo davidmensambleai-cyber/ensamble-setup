@@ -774,9 +774,16 @@ VENDORS: dict = {
                 f'{HOME}/Library/Application Support/Autodesk',
                 f'{HOME}/Library/Caches/com.autodesk.*',
                 f'{HOME}/Library/Preferences/com.autodesk.*',
+                f'{HOME}/Library/WebKit/com.autodesk.*',
+                f'{HOME}/Library/HTTPStorages/com.autodesk.*',
+                f'{HOME}/Library/Logs/com.autodesk.*',
+                f'{HOME}/Library/Logs/Autodesk',
+                '/Library/Logs/Autodesk',
                 '/Library/Application Support/Autodesk',
+                '/Library/Frameworks/Adlm.framework',
                 # Helpers que corren como root (instalación y licencia), como los de Office (I4).
                 '/Library/PrivilegedHelperTools/com.autodesk.*',
+                # No va ~/Library/Mobile Documents/iCloud~com~autodesk~*: son planos del usuario en iCloud.
             ],
             'launch_agent_globs': [
                 f'{HOME}/Library/LaunchAgents/com.autodesk.*',
@@ -848,6 +855,12 @@ VENDORS: dict = {
                 f'{HOME}/Library/Application Support/Graphisoft',
                 f'{HOME}/Library/Preferences/com.graphisoft.*',
                 f'{HOME}/Library/Caches/com.graphisoft.*',
+                f'{HOME}/Library/Caches/Graphisoft',
+                f'{HOME}/Library/Preferences/Graphisoft',
+                f'{HOME}/Library/Logs/Graphisoft',
+                f'{HOME}/Library/Saved Application State/com.graphisoft.*',
+                f'{HOME}/Library/HTTPStorages/com.graphisoft.*',
+                f'{HOME}/Library/WebKit/com.graphisoft.*',
                 '/Library/Application Support/GRAPHISOFT',
                 '/Library/PrivilegedHelperTools/com.graphisoft.*',
             ],
@@ -856,9 +869,10 @@ VENDORS: dict = {
                 '/Library/LaunchAgents/com.graphisoft.*',
             ],
             'launch_daemon_globs': ['/Library/LaunchDaemons/com.graphisoft.*'],
-            # CodeMeter (com.wibu.*) no va aquí: lo usan otros programas y el desinstalador de Archicad
-            # no debe llevárselo. Se aísla con LICENCIAS_COMPARTIDAS_MAC.
-            'pkg_prefixes': ['com.graphisoft.'],
+            # CodeMeter (com.wibu.*) no va aquí: lo usan otros programas. Se aísla con
+            # LICENCIAS_COMPARTIDAS_MAC y se desinstala solo si se pide (LICENCIAS_DESINSTALAR_MAC).
+            # 'ArchiCADVL': recibo real de Archicad 28 (2026-10-21), sin prefijo com.graphisoft.
+            'pkg_prefixes': ['com.graphisoft.', 'ArchiCADVL'],
             'processes': ['Archicad', 'GRAPHISOFT', 'ArchiCAD'],
         },
         'win': {
@@ -911,9 +925,54 @@ VENDORS: dict = {
     },
 }
 
+# Gestores de licencias que el desinstalador ofrece borrar junto al proveedor, con pregunta aparte
+# y respuesta por defecto "no": otros programas pueden usarlos. Rutas verificadas en el Mac mini
+# (2026-10-21) tras desinstalar Archicad 28 a mano.
+LICENCIAS_DESINSTALAR_MAC: dict = {
+    'graphisoft': {
+        'label': 'licencias CodeMeter + WibuKey (Wibu)',
+        'mac': {
+            'app_globs': ['/Applications/CodeMeter.app', '/Applications/WIBUKEY'],
+            'dir_globs': [
+                '/Library/Application Support/CodeMeter',
+                '/Library/Frameworks/WibuCmMacX.framework',
+                '/Library/Java/Extensions/libwibuxpm4j.*',
+                '/Library/Java/Extensions/libwibuKJni.*',
+                '/Library/Java/Extensions/libWibuCmHipApiJni.*',
+                '/Library/Java/Extensions/libwibucmJNI.*',
+                '/Library/Preferences/com.wibu.*.ini',
+                '/Library/Logs/CodeMeter',
+                '/Library/Logs/WIBUKEY',
+                '/usr/local/bin/cmu',
+            ],
+            'launch_daemon_globs': [
+                '/Library/LaunchDaemons/com.wibu.CodeMeter.Server.plist',
+                '/Library/LaunchDaemons/com.wibu.CodeMeter.WebAdmin.plist',
+                '/Library/LaunchDaemons/com.wibu.WIBUKEY.Server.plist',
+            ],
+            'pkg_prefixes': ['com.wibu.'],
+            'processes': ['CodeMeterMacX', 'CmWebAdmin', 'WkSvMacX'],
+        },
+    },
+    'autodesk': {
+        'label': 'licencias FLEXnet Publisher',
+        'mac': {
+            'dir_globs': [
+                '/Library/Application Support/FLEXnet Publisher',
+                '/Library/Preferences/FLEXnet Publisher',
+                '/Library/Preferences/.com.flexnetlicensing',
+            ],
+            'processes': ['FNPLicensingService'],
+        },
+    },
+}
+
 
 def scan_vendor_mac(vendor_id: str) -> dict:
-    profile = VENDORS[vendor_id]['mac']
+    return _scan_profile_mac(VENDORS[vendor_id]['mac'])
+
+
+def _scan_profile_mac(profile: dict) -> dict:
     found: dict = {'apps': [], 'dirs': [], 'launch_agents': [], 'launch_daemons': [], 'packages': []}
 
     for pattern in profile.get('app_globs', []):
@@ -1129,9 +1188,10 @@ def kill_processes_win(processes: list):
 
 
 def uninstall_vendor_mac(vendor_id: str, found: dict, dry_run: bool):
-    profile = VENDORS[vendor_id]['mac']
-    label = VENDORS[vendor_id]['label']
+    _uninstall_profile_mac(VENDORS[vendor_id]['mac'], VENDORS[vendor_id]['label'], found, dry_run)
 
+
+def _uninstall_profile_mac(profile: dict, label: str, found: dict, dry_run: bool):
     info(f'Deteniendo procesos de {label}...')
     if not dry_run:
         kill_processes_mac(profile.get('processes', []))
@@ -1157,10 +1217,12 @@ def uninstall_vendor_mac(vendor_id: str, found: dict, dry_run: bool):
     for path in all_paths:
         info(f'  Eliminando: {path}')
         if not dry_run:
+            # Archicad bloquea sus preferencias con uchg y rmtree falla con "Operation not permitted".
+            subprocess.run(['chflags', '-R', 'nouchg', str(path)], capture_output=True)
             try:
-                if path.is_dir():
+                if path.is_dir() and not path.is_symlink():
                     shutil.rmtree(path)
-                elif path.exists():
+                elif path.exists() or path.is_symlink():
                     path.unlink()
             except Exception as e:
                 warn(f'    No se pudo eliminar {path}: {e}')
@@ -1288,13 +1350,14 @@ def select_vendors(scan_results: dict) -> list:
         print('  Entrada inválida. Intenta de nuevo.')
 
 
-def confirm_uninstall_profesionales(selected: list, scan_results: dict) -> bool:
+def confirm_uninstall_profesionales(selected: list, scan_results: dict, licencias: dict = None) -> bool:
     print(f'\n{LINE}')
     print('  ESTO SE ELIMINARÁ:')
     print(LINE)
-    for vid in selected:
-        r = scan_results[vid]
-        print(f'\n  {VENDORS[vid]["label"]}:')
+    bloques = [(VENDORS[vid]['label'], scan_results[vid]) for vid in selected]
+    bloques += [(LICENCIAS_DESINSTALAR_MAC[vid]['label'], r) for vid, r in (licencias or {}).items()]
+    for etiqueta, r in bloques:
+        print(f'\n  {etiqueta}:')
         for cat, items in r.items():
             if cat == '_total' or not items:
                 continue
@@ -1307,6 +1370,22 @@ def confirm_uninstall_profesionales(selected: list, scan_results: dict) -> bool:
     print('  ⚠  ESTA ACCIÓN ES IRREVERSIBLE')
     confirmacion = input('\n  Escribe "si" para continuar: ').strip().lower()
     return confirmacion == 'si'
+
+
+def elegir_licencias_mac(selected: list) -> dict:
+    elegidas = {}
+    for vid in selected:
+        perfil = LICENCIAS_DESINSTALAR_MAC.get(vid)
+        if not perfil:
+            continue
+        encontrado = _scan_profile_mac(perfil['mac'])
+        if not encontrado['_total']:
+            continue
+        print(f'\n  {perfil["label"]}: {encontrado["_total"]} elemento(s).')
+        warn('Otros programas pueden usar estas licencias. Si no estás seguro, responde n.')
+        if confirm(f'¿Eliminar también las {perfil["label"]}?'):
+            elegidas[vid] = encontrado
+    return elegidas
 
 
 def seccion_programas_profesionales():
@@ -1329,7 +1408,9 @@ def seccion_programas_profesionales():
         info('Nada seleccionado.')
         return
 
-    if not dry_run and not confirm_uninstall_profesionales(selected, scan_results):
+    licencias = elegir_licencias_mac(selected) if IS_MAC else {}
+
+    if not dry_run and not confirm_uninstall_profesionales(selected, scan_results, licencias):
         warn('Cancelado.')
         return
 
@@ -1344,6 +1425,10 @@ def seccion_programas_profesionales():
         else:
             uninstall_vendor_win(vid, scan_results[vid], dry_run)
         ok(f'{VENDORS[vid]["label"]} {"(simulado)" if dry_run else "eliminado"}')
+        if vid in licencias:
+            perfil = LICENCIAS_DESINSTALAR_MAC[vid]
+            _uninstall_profile_mac(perfil['mac'], perfil['label'], licencias[vid], dry_run)
+            ok(f'{perfil["label"]} {"(simulado)" if dry_run else "eliminadas"}')
 
     print(f'\n{LINE}')
     if dry_run:
@@ -2233,7 +2318,8 @@ def _globs_mac_todos_los_usuarios(patrones) -> list:
 # Carpetas de datos que VENDORS lista para el desinstalador: al aislar no se usan. Lo que aparece ahí
 # es de paso (p. ej. la actualización descargada de VS Code en Caches/com.microsoft.VSCode.ShipIt) y,
 # como LuLu bloquea por firma, bloquear esa copia le corta la red también al programa instalado.
-CARPETAS_DE_DATOS_MAC = ('/Library/Caches/', '/Library/Preferences/', '/Library/Saved Application State/')
+CARPETAS_DE_DATOS_MAC = ('/Library/Caches/', '/Library/Preferences/', '/Library/Saved Application State/',
+                         '/Library/Logs/', '/Library/HTTPStorages/', '/Library/WebKit/')
 
 # Solo para aislar en Mac. No van en VENDORS porque VENDORS es también el catálogo del desinstalador:
 # ahí Parallels se llevaría las máquinas virtuales. El Windows de adentro no se aísla con estas reglas
@@ -2261,17 +2347,29 @@ AISLAR_EXTRA_MAC: dict = {
 }
 PERFILES_AISLAR_MAC: dict = {**VENDORS, **AISLAR_EXTRA_MAC}
 
+# Servidores de actualizaciones que "2 Aislar" bloquea en /etc/hosts (0.0.0.0), además de LuLu. Hace falta
+# porque un programa bloqueado puede mandar a un programa de Apple (/usr/bin/curl) a conectarse por él, y
+# LuLu deja pasar lo de Apple: Archicad lo hacía (FIX-022, 2026-11-04). 'nombre' es la marca del bloque en
+# el archivo. Un proveedor entra aquí solo con evidencia de su registro: no se adivinan dominios.
+DOMINIOS_BLOQUEO_MAC: dict = {
+    'graphisoft': {'nombre': 'Graphisoft', 'dominios': ['redirect.graphisoft.com', 'dl.graphisoft.com']},
+}
+
 # Gestor de licencias CodeMeter (WIBU), el de Archicad: el equivalente Mac de SHARED_LICENSING_PATHS.
 # Servidor: /Applications/CodeMeter.app/Contents/MacOS/CodeMeterMacX (LaunchDaemon com.wibu.CodeMeter.Server);
 # datos en /Library/Application Support/CodeMeter (guía de administración de WIBU y soporte de Graphisoft,
 # 2026-10-19). Las dos últimas rutas no salen en la documentación: si no existen, no encuentran nada.
-LICENCIAS_COMPARTIDAS_MAC = [
-    '/Applications/CodeMeter*',
-    '/Applications/WIBUKEY',   # licencias viejas de Wibu; las instala Archicad 28 (2026-10-21)
-    '/Library/Application Support/CodeMeter',
-    '/Library/PrivilegedHelperTools/com.wibu.*',
-    '/usr/local/bin/cmu',
-]
+# FLEXnet (Autodesk) estaba sin internet solo por el choque de firma aceptado el 2026-10-19.
+LICENCIAS_COMPARTIDAS_MAC: dict = {
+    'graphisoft': [
+        '/Applications/CodeMeter*',
+        '/Applications/WIBUKEY',   # licencias viejas de Wibu; las instala Archicad 28 (2026-10-21)
+        '/Library/Application Support/CodeMeter',
+        '/Library/PrivilegedHelperTools/com.wibu.*',
+        '/usr/local/bin/cmu',
+    ],
+    'autodesk': ['/Library/Application Support/FLEXnet Publisher'],
+}
 
 
 def _patrones_aislar_mac(seleccion) -> list:
@@ -2280,8 +2378,7 @@ def _patrones_aislar_mac(seleccion) -> list:
         perfil = PERFILES_AISLAR_MAC[vid].get('mac', {})
         patrones += perfil.get('app_globs', []) + [
             p for p in map(str, perfil.get('dir_globs', [])) if not any(d in p for d in CARPETAS_DE_DATOS_MAC)]
-    if 'graphisoft' in seleccion:
-        patrones += LICENCIAS_COMPARTIDAS_MAC
+        patrones += LICENCIAS_COMPARTIDAS_MAC.get(vid, [])
     return patrones
 
 
@@ -2344,7 +2441,10 @@ def _aislar_mac(dry_run: bool):
     solicitud = CENTINELA_DIR / "_aislar_solicitud.json"
     CENTINELA_DIR.mkdir(parents=True, exist_ok=True)
     solicitud.write_text(json.dumps({'patrones': _globs_mac_todos_los_usuarios(patrones),
-                                     'proveedores': [PERFILES_AISLAR_MAC[v]['label'] for v in seleccion]}),
+                                     'proveedores': [PERFILES_AISLAR_MAC[v]['label'] for v in seleccion],
+                                     'dominios': {DOMINIOS_BLOQUEO_MAC[v]['nombre']: DOMINIOS_BLOQUEO_MAC[v]['dominios']
+                                                  for v in seleccion
+                                                  if DOMINIOS_BLOQUEO_MAC.get(v, {}).get('dominios')}}),
                          encoding="utf-8")
 
     info("\nBuscando ejecutables (puede tardar)...")
@@ -3187,6 +3287,11 @@ LABEL_AGENTE = 'com.ensamble.centinela.revisar'
 TITULO = 'Centinela · Ensamble'
 RECARGA_ESPERA = 10   # macOS reinicia la extensión de LuLu en ~8 s
 DIAS_PRUEBA = 30      # sin un "2 Aislar" nuevo, lo que está en prueba se aprueba solo a los 30 días
+HOSTS = '/etc/hosts'
+CMD_DNS = [['dscacheutil', '-flushcache'], ['killall', '-HUP', 'mDNSResponder']]
+MARCA_INI = '# >>> Ensamble Centinela: '
+MARCA_FIN = '# <<< Ensamble Centinela: '
+MARCA_MANUAL = '# Ensamble 2026-11-04: ArchiCAD sin actualizaciones'   # bloque escrito a mano (FIX-022)
 # Carpeta de plist → dominio de launchctl. 'gui' = uno por cada usuario del equipo.
 DOMINIOS_PERSISTENCIA = {'/Library/LaunchDaemons': 'system', '/Library/LaunchAgents': 'gui'}
 # Arranques de licencia de los proveedores del Centinela (búsqueda web del 2026-10-21; fuentes en
@@ -3650,6 +3755,151 @@ def encender_servicio(a):
     log(f'Arranque automático encendido de nuevo: {a["label"]}')
 
 
+# ─── Dominios en /etc/hosts ───
+# LuLu bloquea programas, no pedidos: Archicad manda a /usr/bin/curl (de Apple, permitido por allowApple)
+# a buscar y descargar sus actualizaciones (FIX-022, 2026-11-04). Apuntar el dominio a 0.0.0.0 corta la
+# conexión la pida quien la pida. dominios.json = {proveedor: [dominios]} es lo que debe estar en el archivo.
+
+def dominio_de_linea(linea):
+    partes = linea.split('#', 1)[0].split()
+    return partes[1].lower() if len(partes) >= 2 and partes[0] == '0.0.0.0' else None
+
+
+def leer_hosts():
+    try:
+        return Path(HOSTS).read_text(encoding='utf-8')
+    except OSError as e:
+        log(f'No se pudo leer {HOSTS}: {e}')
+        return None
+
+
+def bloques_hosts(texto):
+    """{proveedor: [dominios]} de los bloques del Centinela que hay en el archivo."""
+    bloques, actual = {}, None
+    for linea in texto.splitlines():
+        s = linea.strip()
+        if s.startswith(MARCA_INI):
+            actual = s[len(MARCA_INI):]
+            bloques.setdefault(actual, [])
+        elif s.startswith(MARCA_FIN):
+            actual = None
+        elif actual is not None and dominio_de_linea(s):
+            bloques[actual].append(dominio_de_linea(s))
+    return bloques
+
+
+def armar_hosts(texto, deseado):
+    """El archivo con exactamente los bloques de 'deseado', al final. Lo demás queda igual, salvo las
+    líneas del bloque manual del 2026-11-04 cuyo dominio pasa a un bloque (se absorben, no se duplican)."""
+    lineas = texto.splitlines()
+    absorber = {d.lower() for ds in deseado.values() for d in ds}
+    fuera, i = [], 0
+    while i < len(lineas):
+        s = lineas[i].strip()
+        if s.startswith(MARCA_INI):
+            fin = next((k for k in range(i + 1, len(lineas)) if lineas[k].strip().startswith(MARCA_FIN)), None)
+            if fin is None:   # le borraron la marca de cierre: se quitan solo sus líneas de dominio
+                fin = i
+                while fin + 1 < len(lineas) and dominio_de_linea(lineas[fin + 1]):
+                    fin += 1
+            i = fin + 1
+            continue
+        if s == MARCA_MANUAL:
+            j, grupo = i + 1, []
+            while j < len(lineas) and dominio_de_linea(lineas[j]):
+                grupo.append(lineas[j])
+                j += 1
+            quedan = [l for l in grupo if dominio_de_linea(l) not in absorber]
+            if quedan:
+                fuera += [lineas[i]] + quedan
+            i = j
+            continue
+        fuera.append(lineas[i])
+        i += 1
+    while fuera and not fuera[-1].strip():
+        fuera.pop()
+    for prov in sorted(deseado):
+        if deseado[prov]:
+            fuera += ['', MARCA_INI + prov] + [f'0.0.0.0 {d}' for d in deseado[prov]] + [MARCA_FIN + prov]
+    return '\n'.join(fuera) + '\n'
+
+
+def aplicar_hosts(deseado):
+    """Deja en /etc/hosts los bloques de 'deseado'. True si cambió el archivo, False si ya estaba,
+    None si no se pudo leer o escribir."""
+    texto = leer_hosts()
+    if texto is None:
+        return None
+    if not any(deseado.values()) and not bloques_hosts(texto):
+        return False   # nada nuestro que quitar: el archivo no se toca
+    nuevo = armar_hosts(texto, deseado)
+    if nuevo == texto:
+        return False
+    destino = os.path.realpath(HOSTS)   # /etc es un enlace a /private/etc
+    tmp = destino + '.ensamble.tmp'
+    try:
+        st = os.stat(destino)
+        Path(tmp).write_text(nuevo, encoding='utf-8')
+        os.chmod(tmp, st.st_mode & 0o7777)
+        if os.geteuid() == 0:
+            os.chown(tmp, st.st_uid, st.st_gid)
+        os.replace(tmp, destino)
+    except OSError as e:
+        log(f'No se pudo escribir {HOSTS}: {e}')
+        return None
+    for cmd in CMD_DNS:   # sin esto macOS sigue usando la dirección que ya tenía guardada
+        subprocess.run(cmd, capture_output=True)
+    log(f'{HOSTS} actualizado: ' + (', '.join(f'{p} ({len(d)})' for p, d in sorted(deseado.items()) if d)
+                                    or 'sin bloques del Centinela'))
+    return True
+
+
+def aislar_dominios(dominios):
+    """"2 Aislar": suma los dominios pedidos a dominios.json, los escribe y deja en prueba los nuevos."""
+    actual = leer('dominios.json', {})
+    nuevos = [{'accion': 'dominio', 'proveedor': p, 'dominio': d}
+              for p, ds in dominios.items() for d in ds if d not in actual.get(p, [])]
+    for p, ds in dominios.items():
+        actual[p] = sorted(set(actual.get(p, [])) | set(ds))
+    escribir('dominios.json', actual)
+    r = aplicar_hosts(actual)
+    anotar_prueba(nuevos)
+    total = sum(len(ds) for ds in dominios.values())
+    if r is None:
+        print(f'  AVISO: no se pudo escribir {HOSTS}: los servidores de actualizaciones NO quedaron bloqueados '
+              '(ver centinela.log). La revisión automática lo vuelve a intentar.')
+    else:
+        print(f'  {total} servidor(es) de actualizaciones bloqueados en {HOSTS} ({len(nuevos)} nuevo(s)).')
+    return r
+
+
+def revisar_hosts(alertas):
+    """Cada revisión: si falta una línea de bloqueo, se repone y sale como alerta grave. Borrarla pide
+    contraseña de administrador: que alguien lo haya hecho es sospechoso (David, 2026-11-04)."""
+    deseado = {p: ds for p, ds in leer('dominios.json', {}).items() if ds}
+    if not deseado:
+        return
+    texto = leer_hosts()
+    if texto is None:
+        alertas.append(alerta('grave', f'No se pudo leer {HOSTS}: no se sabe si los servidores de actualizaciones '
+                                       'de los proveedores aislados siguen bloqueados.'))
+        return
+    hay = bloques_hosts(texto)
+    faltan = sorted(d for p, ds in deseado.items() for d in ds if d not in hay.get(p, []))
+    if not faltan:
+        if armar_hosts(texto, deseado) != texto:
+            aplicar_hosts(deseado)   # orden o líneas sueltas: se arregla en silencio, no falta nada
+        return
+    if aplicar_hosts(deseado) is None:
+        alertas.append(alerta('grave', f'Alguien borró de {HOSTS} el bloqueo de {", ".join(faltan)} y NO se pudo '
+                                       'reponer: ese programa puede volver a actualizarse solo. Ver centinela.log.'))
+        return
+    log(f'{HOSTS}: bloqueo repuesto de {", ".join(faltan)}')
+    alertas.append(alerta('grave', f'Alguien borró a mano de {HOSTS} el bloqueo de {", ".join(faltan)} (servidores '
+                                   'de actualizaciones de un proveedor aislado). El Centinela lo volvió a poner, pero '
+                                   'borrarlo pide contraseña de administrador: averigua quién fue.'))
+
+
 # ─── Estado en prueba ───
 
 def anotar_prueba(acciones):
@@ -3869,6 +4119,32 @@ def salud(alertas):
         else:
             alertas.append(alerta('info', f'Se repararon las reglas de {len(faltan)} ejecutable(s): estaban borradas, '
                                           'desactivadas o con una regla de permitir encima.'))
+    reparar_cambios_de_firma(alertas, reglas)
+
+
+def reparar_cambios_de_firma(alertas, reglas):
+    """Un programa bloqueado que una actualización dejó con otra identidad para LuLu. LuLu reconoce
+    a los firmados por su firma: si la firma es nueva, la regla vieja (por ruta o por la firma de
+    antes) no lo detiene. Pasó el 2026-10-21: Archicad 28.4.0 reemplazó 13 programas que estaban
+    bloqueados solo por ruta, y quedaron con internet. La regla vieja se deja: no estorba."""
+    bloq = leer('bloqueados.json', [])
+    cambiaron = [b for b in bloq if os.path.exists(b['path']) and clave_lulu(b['path']) not in b.get('claves', [])]
+    if not cambiaron:
+        return
+    hechos = bloquear([b['path'] for b in cambiaron], 'cambio de firma', reglas)
+    recargar()
+    por_ruta = {h['path']: h for h in confirmar(hechos)}
+    escribir('bloqueados.json', [dict(b, claves=sorted(set(b.get('claves', [])) | set(por_ruta[b['path']]['claves'])))
+                                 if b['path'] in por_ruta else b for b in bloq])
+    nombres = ', '.join(os.path.basename(b['path']) for b in cambiaron[:5]) + (' …' if len(cambiaron) > 5 else '')
+    log(f'Cambio de firma: {len(por_ruta)} de {len(cambiaron)} programa(s) bloqueados de nuevo por su firma nueva: '
+        + ', '.join(b['path'] for b in cambiaron))
+    if len(por_ruta) < len(cambiaron):
+        alertas.append(alerta('grave', f'{len(cambiaron) - len(por_ruta)} programa(s) cambiaron de firma y NO se '
+                                       f'pudieron bloquear de nuevo: tienen internet. Ver centinela.log. ({nombres})'))
+    else:
+        alertas.append(alerta('info', f'{len(cambiaron)} programa(s) bloqueados cambiaron de firma (normalmente, por una '
+                                      f'actualización) y se volvieron a bloquear con la firma nueva: {nombres}'))
 
 
 def preferencias(alertas):
@@ -3955,14 +4231,28 @@ def cmd_aislar(archivo, real, aceptar_choques=False, revisar_despues=True):
     # El menú manda {'patrones', 'proveedores'}; una lista sola es el formato anterior.
     patrones = solicitud if isinstance(solicitud, list) else solicitud.get('patrones', [])
     proveedores = [] if isinstance(solicitud, list) else solicitud.get('proveedores', [])
-    raices = sorted({ruta_real(p) for pat in patrones for p in glob.glob(pat)})
+    dominios = {} if isinstance(solicitud, list) else solicitud.get('dominios', {})
+    raices =sorted({ruta_real(p) for pat in patrones for p in glob.glob(pat)})
     wl = {w['path'] for w in leer('whitelist.json', [])}
     exes = sorted(p for p in escanear(raices) if p not in wl)
     ya = {b['path'] for b in leer('bloqueados.json', [])}
     choques = choques_de_firma(exes, ya)
+    # Sin firma de desarrollador el bloqueo es solo por ruta. Es normal en herramientas sueltas, pero
+    # dentro de un .app de un proveedor es raro: si una actualización le pone la firma, LuLu deja de
+    # aplicar esa regla (Archicad, 2026-10-21). Se avisa, no se frena.
+    sin_firma = [p for p in exes if '.app/' in p and leer_firma(p)[0] not in ('devid', 'apple', 'appstore')]
     if not real:
         for p in exes:
-            print(f'  Se bloquearía: {p}' + ('   (ya tenía regla)' if p in ya else ''))
+            print(f'  Se bloquearía: {p}' + ('   (ya tenía regla)' if p in ya else '')
+                  + ('   (SIN firma del proveedor: solo por ruta)' if p in sin_firma else ''))
+        if sin_firma:
+            print(f'  AVISO: {len(sin_firma)} programa(s) dentro de un .app no tienen la firma de su proveedor.')
+        texto = leer_hosts() or ''
+        hay = bloques_hosts(texto)
+        for prov, ds in sorted(dominios.items()):
+            for d in ds:
+                print(f'  Se agregaría a {HOSTS}: 0.0.0.0 {d}   ({prov}'
+                      + (', ya estaba)' if d in hay.get(prov, []) else ')'))
         for p, q in choques:
             print(f'  CHOQUE: {p} tiene la misma firma que {q}, que no es del proveedor')
             print('CHOQUE_PAR ' + json.dumps([p, q]))   # para el menú, que numera los choques
@@ -3998,13 +4288,24 @@ def cmd_aislar(archivo, real, aceptar_choques=False, revisar_despues=True):
     if len(hechos) < len(exes):
         # No se reintentan solos: no quedan en bloqueados.json y la detección salta lo que no cambió.
         print(f'  Los que faltan están en {BASE}/centinela.log. Vuelve a correr "2 Aislar": lo ya bloqueado se salta.')
+    if dominios:
+        aislar_dominios(dominios)
+    extra = []
+    if sin_firma:
+        print(f'  AVISO: {len(sin_firma)} programa(s) dentro de un .app no tienen la firma de su proveedor: quedan '
+              'bloqueados solo por ruta. Si una actualización les pone la firma, la revisión automática los vuelve a bloquear.')
+        log('Aislar: sin firma del proveedor (bloqueo solo por ruta): ' + ', '.join(sin_firma))
+        extra.append({'tipo': 'aviso', 'texto': f'{len(sin_firma)} programa(s) dentro de un .app sin la firma de su '
+                                                'proveedor (bloqueados solo por ruta): '
+                                                + ', '.join(os.path.basename(p) for p in sin_firma[:5])
+                                                + (' …' if len(sin_firma) > 5 else '')})
     if revisar_despues:
         # Al instalar un programa aparecen también sus arranques automáticos: se revisan ya, no el lunes.
         print('  Revisando el equipo para mostrarte los arranques automáticos nuevos (puede tardar)...')
         de = f' de {", ".join(proveedores)}' if proveedores else ''
         n_nuevos = sum(1 for h in hechos if h['path'] not in ya_bloq)
         cmd_detectar(informe_extra=[{'tipo': 'bloqueado', 'texto': f'{len(hechos)} programa(s){de}, {n_nuevos} '
-                                     'nuevo(s) en este aislamiento (los demás ya estaban bloqueados)'}])
+                                     'nuevo(s) en este aislamiento (los demás ya estaban bloqueados)'}] + extra)
 
 
 def cmd_bloquear(p):
@@ -4107,10 +4408,13 @@ def cmd_rollback():
     apagados = leer('apagados.json', [])
     for a in apagados:
         encender_servicio(a)
-    for nombre, vacio in (('bloqueados.json', []), ('zonas.json', []), ('pendientes.json', []), ('estado.json', {}),
+    n_dom = sum(len(ds) for ds in leer('dominios.json', {}).values())
+    aplicar_hosts({})   # quita los bloques del Centinela; el bloque manual sin absorber no es suyo
+    for nombre, vacio in (('dominios.json', {}), ('bloqueados.json', []), ('zonas.json', []), ('pendientes.json', []), ('estado.json', {}),
                           ('prueba.json', {}), ('apagados.json', [])):
         escribir(nombre, vacio)
-    print(f'  {len(bloq)} ejecutable(s) desbloqueados y {len(apagados)} arranque(s) automático(s) encendidos de nuevo.')
+    print(f'  {len(bloq)} ejecutable(s) desbloqueados, {n_dom} servidor(es) de actualizaciones desbloqueados en '
+          f'{HOSTS} y {len(apagados)} arranque(s) automático(s) encendidos de nuevo.')
 
 
 def cmd_volver():
@@ -4138,6 +4442,12 @@ def cmd_volver():
     escribir('baseline_exes.json', base)
     quitar = {a['path'] for a in de('zona')}
     escribir('zonas.json', [z for z in leer('zonas.json', []) if z not in quitar])
+    dom = {(a['proveedor'], a['dominio']) for a in de('dominio')}
+    if dom:
+        actual = {p: [d for d in ds if (p, d) not in dom] for p, ds in leer('dominios.json', {}).items()}
+        actual = {p: ds for p, ds in actual.items() if ds}
+        escribir('dominios.json', actual)
+        aplicar_hosts(actual)
 
     # Arranques: se encienden los que se apagaron y se olvida lo que se dio por visto.
     for a in de('apagado'):
@@ -4151,7 +4461,8 @@ def cmd_volver():
 
     escribir('prueba.json', {})
     escribir('pendientes.json', [])
-    msg = (f'{len(rutas)} bloqueo(s) de internet quitados, {len(labels)} arranque(s) encendidos de nuevo, '
+    msg = (f'{len(rutas)} bloqueo(s) de internet quitados, {len(dom)} servidor(es) de actualizaciones '
+           f'desbloqueados, {len(labels)} arranque(s) encendidos de nuevo, '
            f'{len(vistos)} anotación(es) de arranque por revisar otra vez')
     log(f'Volver al último estado aprobado: {msg}.')
     print(f'  Listo: {msg}.')
@@ -4188,6 +4499,7 @@ def cmd_detectar(informe_extra=None):
         time.sleep(ESPERA_ARRANQUE)
     alertas, informe = [], list(informe_extra or [])
     salud(alertas)
+    revisar_hosts(alertas)
     if not (BASE / 'baseline.json').exists():
         alertas.append(alerta('grave', 'No hay estado aprobado inicial: la detección de cambios no corre. '
                                        'Créalo en EnsambleSetup → Instalación → Aislador + Centinela → 1.'))

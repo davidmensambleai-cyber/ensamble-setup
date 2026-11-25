@@ -44,6 +44,12 @@ NAS_LAN_IP        = "192.168.2.7"
 NAS_TAILSCALE_IP  = "100.81.124.50"
 NAS_HOST_ALIAS    = "nas_local"
 NAS_EXTERNAL_URL  = "nas.ensambleai.com"
+# Un solo nombre en todas partes (nombre-unico-nas-plataforma, David 2026-11-25): en Cloudflare,
+# nas. y plataforma.ensambleai.com apuntan a la IP de la OFICINA (192.168.2.7). En la oficina se
+# llega directo, con o sin Tailscale; fuera, por Tailscale, porque el NAS publica la red de la
+# oficina (192.168.2.0/24) como ruta de subred. Requisito fuera: el equipo acepta esa ruta
+# (accept-routes). Ningun equipo necesita linea en hosts para estos dos nombres.
+PLATAFORMA_HOST   = "plataforma.ensambleai.com"
 SHARE_ENSAMBLE    = "Ensamble"
 SHARE_ARCHIVO     = "ARCHIVO ENSAMBLE"
 DRIVE_ENSAMBLE    = "Z:"
@@ -568,29 +574,38 @@ def diagnosticar(ubicacion):
                                    "No está guardada — conecta una vez desde Finder marcando \"Recordar esta contraseña\"",
                                    "porque la reconexión automática saca la contraseña del llavero: no te la puede preguntar"))
 
-        # ── Navegador dentro de la oficina ─────────────────────────
-        # No basta con que exista el alias en hosts (eso solo dice que el nombre resuelve):
-        # hay que probar que algo responde de verdad en el puerto.
-        # Límite conocido (2026-10-07): el script corre bajo Terminal, que macOS no somete al
-        # permiso de Red local, así que NO puede ver si Chrome lo tiene. Caso real 2026-09-09:
-        # tarjeta verde y Chrome sin entrar. Por eso en Mac el resumen muestra siempre la ruta
-        # del permiso, también en verde.
+        # ── Nombre local de las carpetas (nas_local) ───────────────
+        # nas_local ya NO es para el navegador (desde 2026-11-25 es https://nas.ensambleai.com):
+        # solo lo usan Z:, su credencial guardada, la reconexion automatica y los vinculos de
+        # Excel/CAD guardados con \\nas_local\. Por eso se conserva en hosts.
         if _hosts_tiene_alias():
-            http_ok, _ = _https_responde(NAS_HOST_ALIAS, timeout=4.0, esquema="http", puerto=DSM_HTTP_PORT)
-            if http_ok:
-                capas.append(_capa("Navegador dentro de la oficina", VERDE,
-                                   f"Listo — puedes entrar escribiendo http://{NAS_HOST_ALIAS}:{DSM_HTTP_PORT} en el navegador",
-                                   "para entrar al NAS escribiendo su nombre en el navegador, sin memorizar números"))
-            else:
-                capas.append(_capa("Navegador dentro de la oficina", AMBAR,
-                                   f"El nombre está configurado pero no respondió al probarlo (http://{NAS_HOST_ALIAS}:{DSM_HTTP_PORT}) — "
-                                   "puede ser un permiso del sistema operativo, no del script",
-                                   "para entrar al NAS escribiendo su nombre en el navegador, sin memorizar números",
-                                   None))
+            capas.append(_capa("Nombre local de las carpetas", VERDE,
+                               f"Configurado ({NAS_HOST_ALIAS})",
+                               "para que la carpeta compartida y los vínculos entre archivos encuentren el NAS"))
         else:
-            capas.append(_capa("Navegador dentro de la oficina", ROJO, "Todavía falta configurarlo",
-                               "para entrar al NAS escribiendo su nombre en el navegador, sin memorizar números",
+            capas.append(_capa("Nombre local de las carpetas", ROJO, "Todavía falta configurarlo",
+                               "para que la carpeta compartida y los vínculos entre archivos encuentren el NAS",
                                "configurar"))
+
+        # ── Navegador (NAS) ─────────────────────────────────────────
+        # Se prueba la direccion real, con certificado. Limite conocido (2026-10-07): el
+        # script corre bajo Terminal, que macOS no somete al permiso de Red local, asi que NO
+        # puede ver si Chrome lo tiene. Por eso en Mac el resumen muestra siempre la ruta del
+        # permiso, tambien en verde.
+        nav_ok, _ = _https_responde(NAS_EXTERNAL_URL, timeout=6.0)
+        if nav_ok:
+            capas.append(_capa("Navegador dentro de la oficina", VERDE,
+                               f"Listo — entra con https://{NAS_EXTERNAL_URL} (sin puerto, con candado)",
+                               "para entrar al NAS por el navegador con la misma dirección en la oficina y fuera"))
+        else:
+            capas.append(_capa("Navegador dentro de la oficina", ROJO,
+                               f"https://{NAS_EXTERNAL_URL} no responde — revisa que este computador esté en la red de la oficina",
+                               "para entrar al NAS por el navegador con la misma dirección en la oficina y fuera",
+                               None))
+
+        # ── Plataforma ────────────────────────────────────────────
+        # Caso que la origino (2026-11-25): el Asus sin Tailscale utilizable no abria la plataforma.
+        capas.append(_capa_plataforma(oficina=True))
 
     else:
         # ── Tailscale ────────────────────────────────────────────────
@@ -622,7 +637,8 @@ def diagnosticar(ubicacion):
                                "el programa que te deja entrar al NAS aunque no estés en la oficina", None))
 
         # ── Dirección del NAS en internet ───────────────────────────
-        dns_ok, ips = _dns_resuelve(NAS_EXTERNAL_URL, NAS_TAILSCALE_IP)
+        # Apunta a la IP de la OFICINA desde 2026-11-25 (antes a la de Tailscale).
+        dns_ok, ips = _dns_resuelve(NAS_EXTERNAL_URL, NAS_LAN_IP)
         if dns_ok:
             capas.append(_capa("Dirección del NAS en internet", VERDE, f"{NAS_EXTERNAL_URL} apunta bien",
                                "para que el navegador sepa a dónde ir cuando escribes el nombre del NAS"))
@@ -645,6 +661,9 @@ def diagnosticar(ubicacion):
                                f"https://{NAS_EXTERNAL_URL} no responde todavía",
                                "para entrar al NAS por el navegador, con el candado verde de seguridad, estés donde estés",
                                None if ts_peer else "configurar"))
+
+        # ── Plataforma ────────────────────────────────────────────
+        capas.append(_capa_plataforma(oficina=False, ts_peer=ts_peer))
 
         # ── Synology Drive ────────────────────────────────────────
         if not _synodrive_instalado():
@@ -705,6 +724,15 @@ def enrutar(capas, ubicacion):
             if OS == "Windows":
                 resultado["nota"] = ("La configuración se abrió en otra ventana (con permiso de administrador). "
                                      "Complétala ahí; este resumen refleja el estado de antes.")
+
+    # 1b) Tailscale sin la red de la oficina — no requiere admin
+    if "aceptar_rutas" in acciones:
+        info("")
+        info("Tailscale está encendido, pero no usa la red de la oficina, y por eso la")
+        info("plataforma y el NAS no abren desde aquí.")
+        if confirm("¿Encender esa opción en Tailscale ahora?"):
+            if _aceptar_rutas_tailscale():
+                resultado["acciones"].append("aceptar_rutas")
 
     # 2) Reconectar SynoDrive (dirección antigua) — guía guiada, no se reescribe en silencio
     if "reconectar_synodrive" in acciones:
@@ -1719,22 +1747,79 @@ def _elevar_para_configurar(ubicacion):
         # Sincrónico en Mac — corre en la misma ventana con sudo
         subprocess.run(["/usr/bin/sudo", sys.executable, script, "--configure", flag])
 
-def _hosts_tiene_alias():
-    hosts = r"C:\Windows\System32\drivers\etc\hosts" if OS == "Windows" else "/etc/hosts"
+def _ruta_hosts():
+    return r"C:\Windows\System32\drivers\etc\hosts" if OS == "Windows" else "/etc/hosts"
+
+def _leer_hosts():
+    # errors="replace": el hosts de Windows puede venir en ANSI; sin esto la lectura falla,
+    # el script cree que la linea no existe y la vuelve a agregar en cada corrida.
     try:
-        return NAS_HOST_ALIAS in open(hosts, encoding="utf-8").read()
+        with open(_ruta_hosts(), encoding="utf-8", errors="replace") as f:
+            return f.read()
     except Exception:
+        return ""
+
+def _hosts_ip_de(nombre):
+    """IP a la que hosts lleva `nombre` (lineas activas, sin comentarios), o None si no esta."""
+    for linea in _leer_hosts().splitlines():
+        partes = linea.split("#", 1)[0].split()
+        if len(partes) >= 2 and nombre.lower() in (p.lower() for p in partes[1:]):
+            return partes[0]
+    return None
+
+def _hosts_tiene_alias():
+    return _hosts_ip_de(NAS_HOST_ALIAS) is not None
+
+def _agregar_linea_hosts(ip, nombre, comentario):
+    """True si quedo escrita. Agrega al final; nunca reescribe ni borra lineas existentes."""
+    previo = _leer_hosts()
+    salto = "" if (not previo or previo.endswith("\n")) else "\n"
+    try:
+        with open(_ruta_hosts(), "a", encoding="utf-8") as f:
+            f.write(f"{salto}{ip}    {nombre}    # {comentario}\n")
+        return True
+    except PermissionError:
+        err("No se pudo hacer este cambio — faltan permisos de administrador.")
         return False
 
 def _agregar_hosts():
-    hosts = r"C:\Windows\System32\drivers\etc\hosts" if OS == "Windows" else "/etc/hosts"
-    linea = f"\n{NAS_LAN_IP}    {NAS_HOST_ALIAS}    # NAS Ensamble\n"
-    try:
-        with open(hosts, "a", encoding="utf-8") as f:
-            f.write(linea)
-        ok(f"Listo — ahora puedes escribir '{NAS_HOST_ALIAS}' en el navegador para entrar al NAS.")
-    except PermissionError:
-        err("No se pudo hacer este cambio — faltan permisos de administrador.")
+    if _agregar_linea_hosts(NAS_LAN_IP, NAS_HOST_ALIAS, "NAS Ensamble"):
+        ok(f"Listo — la carpeta compartida ya encuentra el NAS por su nombre local ({NAS_HOST_ALIAS}).")
+
+def _aceptar_rutas_tailscale():
+    """Enciende en Tailscale el uso de la red de la oficina (ruta de subred que publica el NAS)."""
+    cli = _tailscale_cli()
+    if not cli:
+        warn("No encontré el programa de Tailscale para cambiar esa opción.")
+        info("En la app de Tailscale activa \"Use Tailscale subnets\" (usar subredes de Tailscale).")
+        return False
+    r = run(f'"{cli}" set --accept-routes=true', check=False, capture=True)
+    if r.returncode == 0:
+        ok("Listo — Tailscale ya usa la red de la oficina.")
+        return True
+    err("Tailscale no aceptó el cambio: " + ((r.stderr or r.stdout or "").strip() or f"código {r.returncode}"))
+    info("En la app de Tailscale activa \"Use Tailscale subnets\" (usar subredes de Tailscale).")
+    return False
+
+def _capa_plataforma(oficina, ts_peer=False):
+    """Se mide abriendo la plataforma de verdad (HTTPS con certificado valido): prueba que llego
+    al NAS y no a otro aparato con la misma IP (p. ej. la red 192.168.2.x de la casa de Simon)."""
+    para_que = "para usar la plataforma de Ensamble desde este computador"
+    plat_ok, _ = _https_responde(PLATAFORMA_HOST, timeout=6.0)
+    if plat_ok:
+        return _capa("Plataforma", VERDE, f"Abre: https://{PLATAFORMA_HOST}", para_que)
+    if oficina:
+        return _capa("Plataforma", ROJO,
+                     "No abre — revisa que este computador esté conectado a la red de la oficina",
+                     para_que, None)
+    if ts_peer:
+        # Tunel arriba y NAS alcanzable por su IP de Tailscale, pero no por la de la oficina:
+        # el equipo no acepta la ruta de subred.
+        return _capa("Plataforma", ROJO,
+                     "No abre — Tailscale funciona pero no está usando la red de la oficina",
+                     para_que, "aceptar_rutas")
+    return _capa("Plataforma", ROJO, "No abre — primero hay que tener Tailscale funcionando",
+                 para_que, None)
 
 def _instalar_tailscale():
     tmp = tempfile.gettempdir()
@@ -1787,15 +1872,15 @@ def _instalar_synology_drive():
     info("Configura el servidor en Synology Drive:")
     info(f"  Dirección: {NAS_EXTERNAL_URL}  ·  marca SSL  ·  SIN puerto")
     info(f"  (si pidiera puerto: {NAS_EXTERNAL_URL}:{DSM_HTTPS_PORT})")
-    info(f"  Carpeta: {SHARE_ENSAMBLE} → modo On-Demand. Requiere Tailscale activo.")
+    info(f"  Carpeta: {SHARE_ENSAMBLE} → modo On-Demand. Fuera de la oficina requiere Tailscale activo.")
 
 def _configurar_lan():
     title("CONFIGURAR EQUIPO — RED DE LA OFICINA")
 
     if _hosts_tiene_alias():
-        ok(f"Ya puedes escribir '{NAS_HOST_ALIAS}' en el navegador para entrar al NAS.")
+        ok(f"La carpeta compartida ya encuentra el NAS por su nombre local ({NAS_HOST_ALIAS}).")
     else:
-        info("Configurando el acceso al NAS por navegador...")
+        info("Configurando el nombre local del NAS para la carpeta compartida...")
         _agregar_hosts()
 
     info("")
@@ -1875,7 +1960,8 @@ def resumen_final(ubicacion, capas, resultado):
                    "reconectar_synodrive": "Se mostró la guía para reconectar Synology Drive",
                    "conectar": "Se conectó la carpeta compartida",
                    "guardar_credenciales": "Se guardaron las credenciales del NAS",
-                   "crear_tarea_reconexion": "Se configuró la reconexión automática (arranque + cada 10 min)"}
+                   "crear_tarea_reconexion": "Se configuró la reconexión automática (arranque + cada 10 min)",
+                   "aceptar_rutas": "Tailscale quedó usando la red de la oficina"}
         info("")
         info("Qué se hizo hoy:")
         for a in resultado["acciones"]:
@@ -1891,9 +1977,9 @@ def resumen_final(ubicacion, capas, resultado):
         destino = DRIVE_ENSAMBLE if OS == "Windows" else "/Volumes/Ensamble"
         print(f"     1. Carpeta compartida: {destino} — así ves los archivos del NAS como una")
         print(f"        carpeta más de tu computador. Lo más cómodo, dentro de la oficina.")
-        print(f"     2. Por navegador, dentro de la oficina: http://{NAS_HOST_ALIAS}:{DSM_HTTP_PORT}")
-        print(f"        Si escribes https en vez de http sale una advertencia de seguridad:")
-        print(f"        es normal en la red local → \"Avanzado → Continuar\".")
+        print(f"     2. NAS por navegador: https://{NAS_EXTERNAL_URL}  (sin puerto, con candado).")
+        print(f"     3. Plataforma: https://{PLATAFORMA_HOST}")
+        print(f"        Las mismas dos direcciones sirven fuera de la oficina, con Tailscale encendido.")
         nav = por_capa.get("Navegador dentro de la oficina")
         if OS == "Darwin" and nav and nav["estado"] in (VERDE, AMBAR):
             print()
@@ -1912,6 +1998,7 @@ def resumen_final(ubicacion, capas, resultado):
         else:
             print(f"     1. Activa Tailscale y luego entra por el navegador a")
             print(f"        https://{NAS_EXTERNAL_URL}  (sin puerto, candado verde).")
+        print(f"     2. Plataforma: https://{PLATAFORMA_HOST}  (con Tailscale encendido).")
 
     info("")
     info("Si algo deja de conectar, vuelve a abrir este programa:")
